@@ -2,21 +2,20 @@
 
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import {
-  Mic, SkipForward, RotateCcw, CheckCircle2,
-  XCircle, Volume2, Sparkles, Repeat, Headphones,
+  Mic, SkipForward, RotateCcw, Volume2, Repeat, Headphones,
 } from 'lucide-react';
 import { useAppStore } from '@/store/appStore';
 import { useSpeechRecognition } from '@/hooks/useSpeechRecognition';
-import { similarityRatio, removeConsecutiveDuplicates, MATCH_THRESHOLD } from '@/lib/transcript';
+import { removeConsecutiveDuplicates, diffSentenceWords, type WordDiffResult } from '@/lib/transcript';
 import { getGlobalPlayer } from '@/components/player/VideoPlayer';
+import { WordDiffFeedback } from './WordDiffFeedback';
 
 type ShadowState =
-  | 'tracking'     // tracking playback normally
-  | 'listening_loop' // Listen-Only mode: playing sentence N times (NO mic, NO pause)
-  | 'active_exercise' // After N loops finished: video PAUSED, microphone active
-  | 'processing'   // evaluating speech
-  | 'correct'      // match >= 70%
-  | 'incorrect';   // match < 70%
+  | 'tracking'        // tracking playback normally
+  | 'listening_loop'  // Listen-Only mode: playing sentence N times (NO mic, NO pause)
+  | 'active_exercise' // After N loops finished: video HARD PAUSED, microphone active
+  | 'correct'         // word match >= 80%: auto-resumes video
+  | 'incorrect';      // word match < 80%: video remains PAUSED, prompts retry
 
 export function ShadowingMode() {
   const { transcript, currentTimeSec, prepLoopTarget, setPrepLoopTarget } = useAppStore();
@@ -25,9 +24,8 @@ export function ShadowingMode() {
   const [activeLine, setActiveLine] = useState<string>('');
   const [activeLineIndex, setActiveLineIndex] = useState<number>(-1);
   const [currentLoop, setCurrentLoop] = useState<number>(1);
+  const [diffResult, setDiffResult] = useState<WordDiffResult | null>(null);
   const [lastSpoken, setLastSpoken] = useState('');
-  const [similarity, setSimilarity] = useState(0);
-  const [attempts, setAttempts] = useState(0);
 
   const loopTarget = prepLoopTarget || 3;
   const lastTimeMsRef = useRef<number>(0);
@@ -47,44 +45,44 @@ export function ShadowingMode() {
     };
   }, []);
 
-  // ── Speech Recognition in German (de-DE) ──────────────────────────────────
+  // ── Speech Recognition Evaluation (Granular Word Diffing, 80% Threshold) ──
   const handleResult = useCallback(
     (spoken: string) => {
-      if (!isMountedRef.current || !activeLine) return;
+      if (!isMountedRef.current || !normalizedTarget) return;
+
       const cleanSpoken = removeConsecutiveDuplicates(spoken);
-      const cleanTarget = removeConsecutiveDuplicates(activeLine);
-      const sim = similarityRatio(cleanSpoken, cleanTarget);
-
       setLastSpoken(spoken);
-      setSimilarity(sim);
-      setAttempts((a) => a + 1);
-      setShadowState('processing');
 
-      setTimeout(() => {
-        if (!isMountedRef.current) return;
-        if (sim >= MATCH_THRESHOLD) {
-          setShadowState('correct');
-          if (autoResumeTimerRef.current) clearTimeout(autoResumeTimerRef.current);
-          autoResumeTimerRef.current = setTimeout(() => {
-            if (!isMountedRef.current) return;
-            getGlobalPlayer()?.playVideo();
-            setShadowState('tracking');
-            setLastSpoken('');
-            setSimilarity(0);
-            setCurrentLoop(1);
-          }, 1600);
-        } else {
-          setShadowState('incorrect');
-        }
-      }, 350);
+      const diff = diffSentenceWords(cleanSpoken, normalizedTarget);
+      setDiffResult(diff);
+
+      if (diff.isPassing) {
+        // Correct (>= 80%): show green success feedback and resume video
+        setShadowState('correct');
+        if (autoResumeTimerRef.current) clearTimeout(autoResumeTimerRef.current);
+        autoResumeTimerRef.current = setTimeout(() => {
+          if (!isMountedRef.current) return;
+          getGlobalPlayer()?.playVideo();
+          setShadowState('tracking');
+          setLastSpoken('');
+          setDiffResult(null);
+          setCurrentLoop(1);
+        }, 1600);
+      } else {
+        // Fails (< 80%): STRICT PROGRESSION - Video MUST REMAIN PAUSED!
+        setShadowState('incorrect');
+        try {
+          getGlobalPlayer()?.pauseVideo();
+        } catch { /* ignore */ }
+      }
     },
-    [activeLine],
+    [normalizedTarget],
   );
 
-  const { start, abort, isListening } = useSpeechRecognition({
-    lang: 'de-DE',
-    continuous: false,
-    silenceTimeoutMs: 7000,
+  const { start, abort, stopAndEvaluate, isListening, spokenText } = useSpeechRecognition({
+    lang: 'de-DE', // Strictly German locale
+    continuous: true, // Continuous listening so micro-pauses don't interrupt
+    silenceDebounceMs: 2500, // 2.5s silence buffer
     onResult: handleResult,
   });
 
@@ -97,18 +95,21 @@ export function ShadowingMode() {
     window.speechSynthesis.speak(u);
   };
 
-  // ── TRIGGER ACTIVE EXERCISE (Pause video & activate mic) ───────────────────
-  // ONLY called after all N listen loops are completely finished
+  // ── TRIGGER ACTIVE EXERCISE (Hard Pause Video & Open Mic) ──────────────────
   const triggerActiveExercise = useCallback(() => {
     if (autoResumeTimerRef.current) clearTimeout(autoResumeTimerRef.current);
     setShadowState('active_exercise');
+    setDiffResult(null);
+    setLastSpoken('');
 
+    // 1. HARD PAUSE the YouTube video
     try {
       getGlobalPlayer()?.pauseVideo();
     } catch (err) {
       console.warn('Could not pause player:', err);
     }
 
+    // 2. Start speech recognition with unlimited time
     try {
       start();
     } catch (err) {
@@ -116,15 +117,14 @@ export function ShadowingMode() {
     }
   }, [start]);
 
-  // ── START SENTENCE LOOPING (Listen-Only Phase) ─────────────────────────────
+  // ── START SENTENCE PRACTICE (Listen-Only Phase) ────────────────────────────
   const startSentencePractice = useCallback(
     (lineText: string, index: number) => {
       pausedIdxSetRef.current.add(index);
       setActiveLine(lineText);
       setActiveLineIndex(index);
-      setAttempts(0);
       setLastSpoken('');
-      setSimilarity(0);
+      setDiffResult(null);
       setCurrentLoop(1);
 
       if (loopTarget > 1) {
@@ -137,7 +137,7 @@ export function ShadowingMode() {
           getGlobalPlayer()?.playVideo();
         }
       } else {
-        // If loopTarget is 1, pause immediately on 1st completion
+        // LoopTarget is 1: Pause video immediately for mic practice
         triggerActiveExercise();
       }
     },
@@ -158,7 +158,7 @@ export function ShadowingMode() {
       seekingRef.current = false;
     }
 
-    // 1. In 'tracking' mode: detect when a sentence is reached
+    // 1. Tracking mode: detect sentence boundary
     if (shadowState === 'tracking') {
       for (let i = 0; i < transcript.length; i++) {
         const line = transcript[i];
@@ -174,7 +174,7 @@ export function ShadowingMode() {
       }
     }
 
-    // 2. In 'listening_loop' mode: loop N times without pausing or mic
+    // 2. Listening Loop mode: loop N times without pausing or mic
     if (shadowState === 'listening_loop' && activeLineIndex >= 0) {
       const line = transcript[activeLineIndex];
       if (line) {
@@ -191,13 +191,12 @@ export function ShadowingMode() {
         // When playback reaches the end of the sentence
         if (currentTimeSec >= lineEnd || (timeMs >= line.offset + line.duration - 100)) {
           if (currentLoop < loopTarget) {
-            // Replay the sentence again in listen-only mode
             setCurrentLoop((prev) => prev + 1);
             seekingRef.current = true;
             getGlobalPlayer()?.seekTo(lineStart, true);
             getGlobalPlayer()?.playVideo();
           } else {
-            // All N listen-only loops finished! Now pause and demand speech
+            // All N listen-only loops finished: Hard pause and open mic
             triggerActiveExercise();
           }
         }
@@ -214,7 +213,6 @@ export function ShadowingMode() {
     triggerActiveExercise,
   ]);
 
-  // Current playing line for preview
   const currentPlayingLine = useMemo(() => {
     const timeMs = currentTimeSec * 1000;
     return transcript.find((l) => timeMs >= l.offset && timeMs <= l.offset + l.duration) || null;
@@ -226,13 +224,13 @@ export function ShadowingMode() {
     getGlobalPlayer()?.playVideo();
     setShadowState('tracking');
     setLastSpoken('');
-    setSimilarity(0);
+    setDiffResult(null);
     setCurrentLoop(1);
   };
 
   const handleRetry = () => {
     setLastSpoken('');
-    setSimilarity(0);
+    setDiffResult(null);
     setShadowState('active_exercise');
     start();
   };
@@ -282,7 +280,7 @@ export function ShadowingMode() {
               Shadowing Practice
             </h3>
             <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-              Plays {loopTarget}× in Listen-Only mode · Pauses for mic on play {loopTarget + 1}
+              Plays {loopTarget}× in Listen-Only mode · Hard-pauses video for mic on play {loopTarget + 1}
             </span>
           </div>
         </div>
@@ -314,17 +312,17 @@ export function ShadowingMode() {
           <span
             style={{
               fontSize: 11,
-              fontWeight: 600,
+              fontWeight: 700,
               padding: '3px 8px',
               borderRadius: 8,
               background:
-                shadowState === 'active_exercise'
+                shadowState === 'active_exercise' || shadowState === 'incorrect'
                   ? '#fef3c7'
                   : shadowState === 'listening_loop'
                   ? 'var(--accent-50)'
                   : 'var(--bg-elevated)',
               color:
-                shadowState === 'active_exercise'
+                shadowState === 'active_exercise' || shadowState === 'incorrect'
                   ? '#b45309'
                   : shadowState === 'listening_loop'
                   ? 'var(--accent-700)'
@@ -340,15 +338,15 @@ export function ShadowingMode() {
                 height: 6,
                 borderRadius: '50%',
                 background:
-                  shadowState === 'active_exercise'
+                  shadowState === 'active_exercise' || shadowState === 'incorrect'
                     ? '#f59e0b'
                     : shadowState === 'listening_loop'
                     ? 'var(--accent-500)'
                     : 'var(--text-muted)',
               }}
             />
-            {shadowState === 'active_exercise'
-              ? 'Mic Active (Paused)'
+            {shadowState === 'active_exercise' || shadowState === 'incorrect'
+              ? 'Mic Active (Hard Paused)'
               : shadowState === 'listening_loop'
               ? `Listen-Only Loop ${currentLoop}/${loopTarget}`
               : 'Tracking Audio'}
@@ -413,7 +411,7 @@ export function ShadowingMode() {
         </div>
       )}
 
-      {/* ── 2. LISTEN-ONLY PHASE (Plays N times with NO pause and NO mic) ── */}
+      {/* ── 2. LISTEN-ONLY PHASE (Plays N times uninterrupted) ── */}
       {shadowState === 'listening_loop' && (
         <div
           className="animate-fade-in"
@@ -461,7 +459,7 @@ export function ShadowingMode() {
               {normalizedTarget}
             </p>
             <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
-              Listening to native cadence without interruption. The video will pause and activate mic after loop {loopTarget}.
+              Listening to native cadence without interruption. The video will hard-pause and activate mic after loop {loopTarget}.
             </p>
           </div>
 
@@ -483,7 +481,7 @@ export function ShadowingMode() {
         </div>
       )}
 
-      {/* ── 3. ACTIVE EXERCISE (Video PAUSED, Mic Active) ── */}
+      {/* ── 3. ACTIVE EXERCISE (Hard Paused, Unlimited Time, Word-by-Word Diffing) ── */}
       {shadowState !== 'tracking' && shadowState !== 'listening_loop' && (
         <div
           className="animate-fade-in"
@@ -493,27 +491,15 @@ export function ShadowingMode() {
             gap: 12,
             padding: '16px 18px',
             borderRadius: 14,
-            background:
-              shadowState === 'correct'
-                ? 'var(--success-bg)'
-                : shadowState === 'incorrect'
-                ? 'var(--error-bg)'
-                : '#fef3c7',
-            border: `1.5px solid ${
-              shadowState === 'correct'
-                ? 'var(--success)'
-                : shadowState === 'incorrect'
-                ? 'var(--error)'
-                : '#f59e0b'
-            }`,
-            transition: 'all 0.2s ease',
+            background: 'var(--bg-elevated)',
+            border: '1.5px solid var(--border-subtle)',
           }}
         >
           {/* Target sentence display */}
           <div>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
-              <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--accent-700)', textTransform: 'uppercase' }}>
-                Repeat Aloud in German:
+              <span style={{ fontSize: 11, fontWeight: 800, color: 'var(--accent-700)', textTransform: 'uppercase' }}>
+                Target German Sentence (Hard Paused):
               </span>
               <button
                 onClick={() => speakReference(normalizedTarget)}
@@ -534,68 +520,19 @@ export function ShadowingMode() {
                 <Volume2 size={12} /> Listen
               </button>
             </div>
-            <p style={{ fontSize: 17, fontWeight: 750, color: 'var(--text-primary)', lineHeight: 1.35 }}>
+            <p style={{ fontSize: 18, fontWeight: 750, color: 'var(--text-primary)', lineHeight: 1.35 }}>
               {normalizedTarget}
             </p>
           </div>
 
-          {/* User Spoken Input */}
-          <div
-            style={{
-              padding: '10px 14px',
-              borderRadius: 10,
-              background: 'var(--bg-card)',
-              border: '1px solid var(--border-subtle)',
-              display: 'flex',
-              alignItems: 'center',
-              gap: 10,
-            }}
-          >
-            <div
-              style={{
-                width: 32,
-                height: 32,
-                borderRadius: '50%',
-                background: isListening ? '#fee2e2' : 'var(--bg-elevated)',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                flexShrink: 0,
-              }}
-            >
-              <Mic size={16} color={isListening ? '#ef4444' : 'var(--text-muted)'} className={isListening ? 'animate-pulse' : ''} />
-            </div>
-
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                {isListening ? 'Listening (German de-DE)… Speak now' : 'Spoken transcript:'}
-              </div>
-              <div style={{ fontSize: 13.5, fontWeight: 600, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {lastSpoken || (isListening ? '…' : 'No speech detected yet')}
-              </div>
-            </div>
-
-            {similarity > 0 && (
-              <span style={{ fontSize: 12, fontWeight: 700, color: similarity >= MATCH_THRESHOLD ? 'var(--success)' : 'var(--error)' }}>
-                {Math.round(similarity * 100)}% match
-              </span>
-            )}
-          </div>
-
-          {/* Feedback banner */}
-          {shadowState === 'correct' && (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--success)', fontSize: 13, fontWeight: 700 }}>
-              <CheckCircle2 size={16} />
-              <span>Ausgezeichnet! Great German pronunciation. Resuming video…</span>
-            </div>
-          )}
-
-          {shadowState === 'incorrect' && (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--error)', fontSize: 13, fontWeight: 650 }}>
-              <XCircle size={16} />
-              <span>Match was below 70%. Try again or replay sentence!</span>
-            </div>
-          )}
+          {/* Granular Word-by-Word Diff & Mic Component */}
+          <WordDiffFeedback
+            diffResult={diffResult}
+            spokenText={spokenText || lastSpoken}
+            isListening={isListening}
+            onStopSpeaking={stopAndEvaluate}
+            passingThreshold={80}
+          />
 
           {/* Action buttons */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
@@ -611,13 +548,13 @@ export function ShadowingMode() {
                   background: 'var(--accent-500)',
                   color: '#ffffff',
                   fontSize: 12,
-                  fontWeight: 650,
+                  fontWeight: 700,
                   border: 'none',
                   cursor: 'pointer',
                 }}
               >
                 <RotateCcw size={13} />
-                Try Again
+                Try Speaking Again
               </button>
             )}
 

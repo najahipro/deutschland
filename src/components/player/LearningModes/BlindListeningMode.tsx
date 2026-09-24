@@ -2,21 +2,21 @@
 
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import {
-  Ear, Eye, EyeOff, Mic, RotateCcw, CheckCircle2,
-  XCircle, SkipForward, Volume2, Sparkles, Repeat, Headphones,
+  Ear, Eye, EyeOff, Mic, RotateCcw,
+  SkipForward, Volume2, Headphones,
 } from 'lucide-react';
 import { useAppStore } from '@/store/appStore';
 import { useSpeechRecognition } from '@/hooks/useSpeechRecognition';
-import { similarityRatio, removeConsecutiveDuplicates, MATCH_THRESHOLD } from '@/lib/transcript';
+import { removeConsecutiveDuplicates, diffSentenceWords, type WordDiffResult } from '@/lib/transcript';
 import { getGlobalPlayer } from '@/components/player/VideoPlayer';
+import { WordDiffFeedback } from './WordDiffFeedback';
 
 type BlindState =
   | 'tracking'        // watching with subtitles blacked out
   | 'listening_loop'  // listen-only replay phase
-  | 'listening'       // video PAUSED at sentence end, microphone active (de-DE)
-  | 'processing'      // evaluating speech
-  | 'correct'         // accurate repetition
-  | 'incorrect'       // inaccurate repetition
+  | 'listening'       // video HARD PAUSED at sentence end, microphone active (de-DE)
+  | 'correct'         // accurate repetition >= 80%
+  | 'incorrect'       // repetition < 80%: video stays PAUSED, prompts retry
   | 'revealed';       // subtitle revealed
 
 export function BlindListeningMode() {
@@ -26,8 +26,8 @@ export function BlindListeningMode() {
   const [activeLine, setActiveLine] = useState<string>('');
   const [activeLineIndex, setActiveLineIndex] = useState<number>(-1);
   const [currentLoop, setCurrentLoop] = useState<number>(1);
+  const [diffResult, setDiffResult] = useState<WordDiffResult | null>(null);
   const [lastSpoken, setLastSpoken] = useState('');
-  const [similarity, setSimilarity] = useState(0);
 
   const loopTarget = prepLoopTarget || 1;
   const lastTimeMsRef = useRef<number>(0);
@@ -46,52 +46,53 @@ export function BlindListeningMode() {
     };
   }, []);
 
-  // ── Speech Recognition in German (de-DE) ──────────────────────────────────
+  // ── Speech Recognition Evaluation (Granular 80% Word Matching) ─────────────
   const handleResult = useCallback(
     (spoken: string) => {
-      if (!isMountedRef.current || !activeLine) return;
+      if (!isMountedRef.current || !normalizedTarget) return;
+
       const cleanSpoken = removeConsecutiveDuplicates(spoken);
-      const cleanTarget = removeConsecutiveDuplicates(activeLine);
-      const sim = similarityRatio(cleanSpoken, cleanTarget);
-
       setLastSpoken(spoken);
-      setSimilarity(sim);
-      setBlindState('processing');
 
-      setTimeout(() => {
-        if (!isMountedRef.current) return;
-        if (sim >= MATCH_THRESHOLD) {
-          setBlindState('correct');
-          if (autoResumeTimerRef.current) clearTimeout(autoResumeTimerRef.current);
-          autoResumeTimerRef.current = setTimeout(() => {
-            if (!isMountedRef.current) return;
-            getGlobalPlayer()?.playVideo();
-            setBlindState('tracking');
-            setLastSpoken('');
-            setSimilarity(0);
-            setCurrentLoop(1);
-          }, 1800);
-        } else {
-          setBlindState('incorrect');
-        }
-      }, 300);
+      const diff = diffSentenceWords(cleanSpoken, normalizedTarget);
+      setDiffResult(diff);
+
+      if (diff.isPassing) {
+        // Correct (>= 80%): Reveal subtitle and auto-resume
+        setBlindState('correct');
+        if (autoResumeTimerRef.current) clearTimeout(autoResumeTimerRef.current);
+        autoResumeTimerRef.current = setTimeout(() => {
+          if (!isMountedRef.current) return;
+          getGlobalPlayer()?.playVideo();
+          setBlindState('tracking');
+          setLastSpoken('');
+          setDiffResult(null);
+          setCurrentLoop(1);
+        }, 1800);
+      } else {
+        // Failed (< 80%): Video stays PAUSED, prompts retry
+        setBlindState('incorrect');
+        try {
+          getGlobalPlayer()?.pauseVideo();
+        } catch { /* ignore */ }
+      }
     },
-    [activeLine],
+    [normalizedTarget],
   );
 
-  const { start, abort, isListening } = useSpeechRecognition({
-    lang: 'de-DE',
-    continuous: false,
-    silenceTimeoutMs: 7000,
+  const { start, abort, stopAndEvaluate, isListening, spokenText } = useSpeechRecognition({
+    lang: 'de-DE', // Strictly German locale
+    continuous: true, // Continuous listening
+    silenceDebounceMs: 2500, // 2.5s silence buffer
     onResult: handleResult,
   });
 
-  // ── PAUSE VIDEO & ACTIVATE MICROPHONE IMMEDIATELY ────────────────────────
+  // ── HARD PAUSE VIDEO & ACTIVATE MICROPHONE IMMEDIATELY ─────────────────────
   const pauseAndActivateMic = useCallback(
     (lineText: string, index: number) => {
       if (autoResumeTimerRef.current) clearTimeout(autoResumeTimerRef.current);
 
-      // 1. Immediately pause YouTube player
+      // 1. Immediately HARD PAUSE YouTube player
       const player = getGlobalPlayer();
       try {
         player?.pauseVideo();
@@ -103,10 +104,10 @@ export function BlindListeningMode() {
       setActiveLine(lineText);
       setActiveLineIndex(index);
       setLastSpoken('');
-      setSimilarity(0);
+      setDiffResult(null);
       setBlindState('listening');
 
-      // 3. Trigger Web Speech API (de-DE) immediately
+      // 3. Trigger continuous speech recognition (de-DE)
       try {
         start();
       } catch (err) {
@@ -137,7 +138,6 @@ export function BlindListeningMode() {
         const lineStart = line.offset;
         const lineEnd = line.offset + line.duration;
 
-        // When current time reaches the end of the sentence
         const reachedEnd = timeMs >= lineEnd - 120 && timeMs <= lineEnd + 800;
         const crossed = prevTimeMs < lineEnd && timeMs >= lineEnd - 120;
 
@@ -145,7 +145,6 @@ export function BlindListeningMode() {
           lastTriggeredIdxRef.current = i;
 
           if (loopTarget > 1) {
-            // Start listen-only loop phase
             setActiveLine(line.text);
             setActiveLineIndex(i);
             setCurrentLoop(1);
@@ -154,7 +153,6 @@ export function BlindListeningMode() {
             getGlobalPlayer()?.seekTo(lineStart / 1000, true);
             getGlobalPlayer()?.playVideo();
           } else {
-            // Loop target is 1: Pause video immediately and start mic!
             pauseAndActivateMic(line.text, i);
           }
           break;
@@ -162,7 +160,7 @@ export function BlindListeningMode() {
       }
     }
 
-    // 2. LISTEN-ONLY LOOP MODE: Replay N times, then pause video and activate mic
+    // 2. LISTEN-ONLY LOOP MODE: Replay N times, then hard-pause and open mic
     if (blindState === 'listening_loop' && activeLineIndex >= 0) {
       const line = transcript[activeLineIndex];
       if (line) {
@@ -183,7 +181,7 @@ export function BlindListeningMode() {
             getGlobalPlayer()?.seekTo(lineStart, true);
             getGlobalPlayer()?.playVideo();
           } else {
-            // Finished defined loops: PAUSE VIDEO IMMEDIATELY & START MIC
+            // Finished defined loops: HARD PAUSE VIDEO IMMEDIATELY & START MIC
             pauseAndActivateMic(line.text, activeLineIndex);
           }
         }
@@ -199,7 +197,6 @@ export function BlindListeningMode() {
     pauseAndActivateMic,
   ]);
 
-  // Current playing line for preview
   const currentPlayingLine = useMemo(() => {
     const timeMs = currentTimeSec * 1000;
     return transcript.find((l) => timeMs >= l.offset && timeMs <= l.offset + l.duration) || null;
@@ -211,13 +208,13 @@ export function BlindListeningMode() {
     getGlobalPlayer()?.playVideo();
     setBlindState('tracking');
     setLastSpoken('');
-    setSimilarity(0);
+    setDiffResult(null);
     setCurrentLoop(1);
   };
 
   const handleRetry = () => {
     setLastSpoken('');
-    setSimilarity(0);
+    setDiffResult(null);
     setBlindState('listening');
     start();
   };
@@ -271,7 +268,7 @@ export function BlindListeningMode() {
               Blind Listening Mode
             </h3>
             <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-              Subtitles 100% blacked out · Video auto-pauses at sentence end for repetition
+              Subtitles 100% blacked out · Video hard-pauses at sentence end for repetition
             </span>
           </div>
         </div>
@@ -303,27 +300,27 @@ export function BlindListeningMode() {
           <span
             style={{
               fontSize: 11,
-              fontWeight: 700,
+              fontWeight: 750,
               padding: '4px 10px',
               borderRadius: 8,
               background:
-                blindState === 'listening'
-                  ? '#fee2e2'
+                blindState === 'listening' || blindState === 'incorrect'
+                  ? '#fef3c7'
                   : '#111827',
               color:
-                blindState === 'listening'
-                  ? '#b91c1c'
+                blindState === 'listening' || blindState === 'incorrect'
+                  ? '#b45309'
                   : '#fbbf24',
               display: 'inline-flex',
               alignItems: 'center',
               gap: 5,
-              border: `1px solid ${blindState === 'listening' ? '#fecdd3' : '#374151'}`,
+              border: `1px solid ${blindState === 'listening' || blindState === 'incorrect' ? '#fde68a' : '#374151'}`,
             }}
           >
-            {blindState === 'listening' ? (
+            {blindState === 'listening' || blindState === 'incorrect' ? (
               <>
                 <Mic size={12} className="animate-pulse" />
-                <span>VIDEO PAUSED — SPEAK NOW!</span>
+                <span>VIDEO HARD PAUSED — SPEAK NOW</span>
               </>
             ) : (
               <>
@@ -356,7 +353,7 @@ export function BlindListeningMode() {
               Listening Strictly By Ear…
             </p>
             <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 3 }}>
-              When this German sentence ends, the video will automatically pause and activate your microphone!
+              When this German sentence ends, the video will automatically hard-pause and activate your microphone!
             </p>
           </div>
 
@@ -451,7 +448,7 @@ export function BlindListeningMode() {
         </div>
       )}
 
-      {/* ── 3. PAUSED FOR SPEECH: VIDEO PAUSED, MIC RECORDING (de-DE) ── */}
+      {/* ── 3. PAUSED FOR SPEECH: VIDEO HARD PAUSED, MIC RECORDING (de-DE) ── */}
       {blindState !== 'tracking' && blindState !== 'listening_loop' && (
         <div
           className="animate-fade-in"
@@ -461,22 +458,11 @@ export function BlindListeningMode() {
             gap: 12,
             padding: '16px 18px',
             borderRadius: 14,
-            background:
-              blindState === 'correct'
-                ? 'var(--success-bg)'
-                : blindState === 'incorrect'
-                ? 'var(--error-bg)'
-                : '#fff1f2',
-            border: `1.5px solid ${
-              blindState === 'correct'
-                ? 'var(--success)'
-                : blindState === 'incorrect'
-                ? 'var(--error)'
-                : '#fecdd3'
-            }`,
+            background: 'var(--bg-elevated)',
+            border: '1.5px solid var(--border-subtle)',
           }}
         >
-          {/* Subtitle Card (Blacked out unless revealed) */}
+          {/* Subtitle Card (Blacked out unless revealed or passed) */}
           <div
             style={{
               padding: '14px 16px',
@@ -503,62 +489,14 @@ export function BlindListeningMode() {
             )}
           </div>
 
-          {/* Voice Input Feedback: Actively Recording */}
-          <div
-            style={{
-              padding: '10px 14px',
-              borderRadius: 10,
-              background: 'var(--bg-card)',
-              border: '1px solid var(--border-subtle)',
-              display: 'flex',
-              alignItems: 'center',
-              gap: 10,
-            }}
-          >
-            <div
-              style={{
-                width: 34,
-                height: 34,
-                borderRadius: '50%',
-                background: isListening ? '#fee2e2' : 'var(--bg-elevated)',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                flexShrink: 0,
-              }}
-            >
-              <Mic size={17} color={isListening ? '#ef4444' : 'var(--text-muted)'} className={isListening ? 'animate-pulse' : ''} />
-            </div>
-
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontSize: 11, color: isListening ? '#ef4444' : 'var(--text-muted)', fontWeight: isListening ? 700 : 500 }}>
-                {isListening ? '🎙️ Recording your German speech (de-DE)… Speak now!' : 'Spoken repetition:'}
-              </div>
-              <div style={{ fontSize: 13.5, fontWeight: 600, color: 'var(--text-primary)' }}>
-                {lastSpoken || (isListening ? 'Listening…' : 'No speech recorded yet')}
-              </div>
-            </div>
-
-            {similarity > 0 && (
-              <span style={{ fontSize: 12, fontWeight: 700, color: similarity >= MATCH_THRESHOLD ? 'var(--success)' : 'var(--error)' }}>
-                {Math.round(similarity * 100)}% match
-              </span>
-            )}
-          </div>
-
-          {blindState === 'correct' && (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--success)', fontSize: 13, fontWeight: 700 }}>
-              <CheckCircle2 size={16} />
-              <span>Fantastisch! Accurate ear comprehension ({Math.round(similarity * 100)}%). Resuming video…</span>
-            </div>
-          )}
-
-          {blindState === 'incorrect' && (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--error)', fontSize: 13, fontWeight: 650 }}>
-              <XCircle size={16} />
-              <span>Didn&apos;t quite match. Replay audio, try speaking again, or reveal subtitle.</span>
-            </div>
-          )}
+          {/* Granular Word-by-Word Diff & Mic Component */}
+          <WordDiffFeedback
+            diffResult={diffResult}
+            spokenText={spokenText || lastSpoken}
+            isListening={isListening}
+            onStopSpeaking={stopAndEvaluate}
+            passingThreshold={80}
+          />
 
           {/* Action buttons */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
@@ -574,13 +512,13 @@ export function BlindListeningMode() {
                   background: 'var(--accent-500)',
                   color: '#ffffff',
                   fontSize: 12,
-                  fontWeight: 650,
+                  fontWeight: 700,
                   border: 'none',
                   cursor: 'pointer',
                 }}
               >
                 <RotateCcw size={13} />
-                Try Again
+                Try Speaking Again
               </button>
             )}
 

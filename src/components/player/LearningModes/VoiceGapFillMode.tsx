@@ -2,53 +2,29 @@
 
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import {
-  Mic, SkipForward, RotateCcw, CheckCircle2,
-  XCircle, Eye, MessageSquareDashed, Sparkles, Repeat, Headphones,
+  Mic, SkipForward, RotateCcw,
+  Eye, MessageSquareDashed, Repeat, Headphones,
 } from 'lucide-react';
 import { useAppStore } from '@/store/appStore';
 import { useSpeechRecognition } from '@/hooks/useSpeechRecognition';
-import { buildGapFillExercise, removeConsecutiveDuplicates } from '@/lib/transcript';
+import {
+  buildGapFillExercise,
+  removeConsecutiveDuplicates,
+  cleanWord,
+  wordsMatch,
+  type WordDiffResult,
+} from '@/lib/transcript';
 import { getGlobalPlayer } from '@/components/player/VideoPlayer';
 import type { GapFillExercise } from '@/lib/types';
+import { WordDiffFeedback } from './WordDiffFeedback';
 
 type GapState =
   | 'tracking'        // tracking video playback
-  | 'listening_loop'  // Listen-Only mode: plays N times uninterrupted (NO gap fill, NO pause, NO mic)
-  | 'active_exercise' // After N loops finished: video PAUSED, blank shown, mic active
-  | 'processing'      // evaluating spoken word
+  | 'listening_loop'  // Listen-Only mode: plays N times uninterrupted
+  | 'active_exercise' // After N loops finished: video HARD PAUSED, blank shown, mic active
   | 'correct'         // right word — resuming
-  | 'incorrect'       // wrong word — show retry
+  | 'incorrect'       // wrong word — video remains PAUSED, show retry
   | 'revealed';       // showing answer before resuming
-
-function normalizeWord(w: string): string {
-  return removeConsecutiveDuplicates(w)
-    .toLowerCase()
-    .replace(/[.,!?;:"""''„"()\[\]]/g, '')
-    .trim();
-}
-
-function wordMatches(spoken: string, target: string): boolean {
-  const normTarget = normalizeWord(target);
-  const spokenWords = removeConsecutiveDuplicates(spoken).toLowerCase().split(/\s+/);
-  return spokenWords.some((w) => {
-    const normW = normalizeWord(w);
-    if (normW === normTarget) return true;
-    const maxDist = normTarget.length <= 4 ? 1 : 2;
-    return editDistance(normW, normTarget) <= maxDist;
-  });
-}
-
-function editDistance(a: string, b: string): number {
-  const m = a.length, n = b.length;
-  const dp = Array.from({ length: m + 1 }, (_, i) =>
-    Array.from({ length: n + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0))
-  );
-  for (let i = 1; i <= m; i++)
-    for (let j = 1; j <= n; j++)
-      dp[i][j] = a[i - 1] === b[j - 1] ? dp[i - 1][j - 1]
-        : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
-  return dp[m][n];
-}
 
 export function VoiceGapFillMode() {
   const { transcript, currentTimeSec, prepLoopTarget, setPrepLoopTarget } = useAppStore();
@@ -57,8 +33,8 @@ export function VoiceGapFillMode() {
   const [exercise, setExercise] = useState<GapFillExercise | null>(null);
   const [exerciseIndex, setExerciseIndex] = useState<number>(-1);
   const [currentLoop, setCurrentLoop] = useState<number>(1);
+  const [diffResult, setDiffResult] = useState<WordDiffResult | null>(null);
   const [lastSpoken, setLastSpoken] = useState('');
-  const [attempts, setAttempts] = useState(0);
 
   const loopTarget = prepLoopTarget || 3;
   const lastTimeMsRef = useRef<number>(0);
@@ -79,44 +55,69 @@ export function VoiceGapFillMode() {
     (spoken: string) => {
       if (!isMountedRef.current || !exercise) return;
       const cleanSpoken = removeConsecutiveDuplicates(spoken);
-      setLastSpoken(cleanSpoken);
-      setAttempts((a) => a + 1);
-      setGapState('processing');
+      setLastSpoken(spoken);
 
-      const matched = wordMatches(cleanSpoken, exercise.targetWord);
+      const targetWordClean = cleanWord(exercise.targetWord);
+      const spokenTokens = cleanSpoken.split(/\s+/).filter(Boolean);
 
-      setTimeout(() => {
-        if (!isMountedRef.current) return;
-        if (matched) {
-          setGapState('correct');
-          if (autoResumeTimerRef.current) clearTimeout(autoResumeTimerRef.current);
-          autoResumeTimerRef.current = setTimeout(() => {
-            if (!isMountedRef.current) return;
-            getGlobalPlayer()?.playVideo();
-            setGapState('tracking');
-            setLastSpoken('');
-            setCurrentLoop(1);
-          }, 1800);
-        } else {
-          setGapState('incorrect');
+      // Check if target word exists in spoken tokens
+      let matchedIndex = -1;
+      spokenTokens.forEach((token, idx) => {
+        if (wordsMatch(token, targetWordClean)) {
+          matchedIndex = idx;
         }
-      }, 350);
+      });
+
+      const isMatch = matchedIndex !== -1;
+      const diff: WordDiffResult = {
+        score: isMatch ? 100 : 0,
+        isPassing: isMatch,
+        spokenDiffs: spokenTokens.map((w, idx) => ({
+          word: w,
+          isCorrect: idx === matchedIndex,
+        })),
+        missingWords: isMatch ? [] : [exercise.targetWord],
+        matchedWordsCount: isMatch ? 1 : 0,
+        totalTargetWords: 1,
+      };
+
+      setDiffResult(diff);
+
+      if (isMatch) {
+        setGapState('correct');
+        if (autoResumeTimerRef.current) clearTimeout(autoResumeTimerRef.current);
+        autoResumeTimerRef.current = setTimeout(() => {
+          if (!isMountedRef.current) return;
+          getGlobalPlayer()?.playVideo();
+          setGapState('tracking');
+          setLastSpoken('');
+          setDiffResult(null);
+          setCurrentLoop(1);
+        }, 1800);
+      } else {
+        // Incorrect: STRICT PROGRESSION - Keep video PAUSED!
+        setGapState('incorrect');
+        try {
+          getGlobalPlayer()?.pauseVideo();
+        } catch { /* ignore */ }
+      }
     },
     [exercise],
   );
 
-  const { start, abort, isListening } = useSpeechRecognition({
-    lang: 'de-DE',
-    continuous: false,
-    silenceTimeoutMs: 6500,
+  const { start, abort, stopAndEvaluate, isListening, spokenText } = useSpeechRecognition({
+    lang: 'de-DE', // Strictly German locale
+    continuous: true, // Continuous listening
+    silenceDebounceMs: 2500, // 2.5s silence buffer
     onResult: handleResult,
   });
 
-  // ── TRIGGER ACTIVE EXERCISE (Pause player, hide word, turn on mic) ─────────
-  // ONLY called after all N listen loops are completely finished
+  // ── TRIGGER ACTIVE EXERCISE (Hard Pause Video & Open Mic) ──────────────────
   const triggerActiveExercise = useCallback(() => {
     if (autoResumeTimerRef.current) clearTimeout(autoResumeTimerRef.current);
     setGapState('active_exercise');
+    setDiffResult(null);
+    setLastSpoken('');
 
     try {
       getGlobalPlayer()?.pauseVideo();
@@ -137,12 +138,11 @@ export function VoiceGapFillMode() {
       pausedIdxSetRef.current.add(index);
       setExercise(ex);
       setExerciseIndex(index);
-      setAttempts(0);
       setLastSpoken('');
+      setDiffResult(null);
       setCurrentLoop(1);
 
       if (loopTarget > 1) {
-        // Play sentence in Listen-Only mode (NO pausing, NO mic)
         setGapState('listening_loop');
         seekingRef.current = true;
         getGlobalPlayer()?.seekTo(ex.line.offset / 1000, true);
@@ -205,7 +205,7 @@ export function VoiceGapFillMode() {
           getGlobalPlayer()?.seekTo(lineStart, true);
           getGlobalPlayer()?.playVideo();
         } else {
-          // All N listen-only loops finished! Now pause and show blank
+          // All N listen-only loops finished: Hard pause and open mic
           triggerActiveExercise();
         }
       }
@@ -221,7 +221,6 @@ export function VoiceGapFillMode() {
     triggerActiveExercise,
   ]);
 
-  // Current playing line for preview
   const currentPlayingLine = useMemo(() => {
     const timeMs = currentTimeSec * 1000;
     return transcript.find((l) => timeMs >= l.offset && timeMs <= l.offset + l.duration) || null;
@@ -233,6 +232,7 @@ export function VoiceGapFillMode() {
     getGlobalPlayer()?.playVideo();
     setGapState('tracking');
     setLastSpoken('');
+    setDiffResult(null);
     setCurrentLoop(1);
   };
 
@@ -244,12 +244,14 @@ export function VoiceGapFillMode() {
       getGlobalPlayer()?.playVideo();
       setGapState('tracking');
       setLastSpoken('');
+      setDiffResult(null);
       setCurrentLoop(1);
     }, 2400);
   };
 
   const handleRetry = () => {
     setLastSpoken('');
+    setDiffResult(null);
     setGapState('active_exercise');
     start();
   };
@@ -289,7 +291,7 @@ export function VoiceGapFillMode() {
               Voice Gap Fill
             </h3>
             <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-              Plays {loopTarget}× in Listen-Only mode · Pauses for missing word on play {loopTarget + 1}
+              Plays {loopTarget}× in Listen-Only mode · Hard-pauses video for missing word on play {loopTarget + 1}
             </span>
           </div>
         </div>
@@ -321,17 +323,17 @@ export function VoiceGapFillMode() {
           <span
             style={{
               fontSize: 11,
-              fontWeight: 600,
+              fontWeight: 750,
               padding: '3px 8px',
               borderRadius: 8,
               background:
-                gapState === 'active_exercise'
+                gapState === 'active_exercise' || gapState === 'incorrect'
                   ? '#fef3c7'
                   : gapState === 'listening_loop'
                   ? 'var(--accent-50)'
                   : 'var(--bg-elevated)',
               color:
-                gapState === 'active_exercise'
+                gapState === 'active_exercise' || gapState === 'incorrect'
                   ? '#b45309'
                   : gapState === 'listening_loop'
                   ? 'var(--accent-700)'
@@ -347,15 +349,15 @@ export function VoiceGapFillMode() {
                 height: 6,
                 borderRadius: '50%',
                 background:
-                  gapState === 'active_exercise'
+                  gapState === 'active_exercise' || gapState === 'incorrect'
                     ? '#f59e0b'
                     : gapState === 'listening_loop'
                     ? 'var(--accent-500)'
                     : 'var(--text-muted)',
               }}
             />
-            {gapState === 'active_exercise'
-              ? 'Speak Missing Word'
+            {gapState === 'active_exercise' || gapState === 'incorrect'
+              ? 'Speak Missing Word (Hard Paused)'
               : gapState === 'listening_loop'
               ? `Listen-Only Loop ${currentLoop}/${loopTarget}`
               : 'Tracking Audio'}
@@ -423,7 +425,7 @@ export function VoiceGapFillMode() {
         </div>
       )}
 
-      {/* ── 2. LISTEN-ONLY PHASE (Plays N times with NO pause and NO mic) ── */}
+      {/* ── 2. LISTEN-ONLY PHASE ── */}
       {gapState === 'listening_loop' && exercise && (
         <div
           className="animate-fade-in"
@@ -493,7 +495,7 @@ export function VoiceGapFillMode() {
         </div>
       )}
 
-      {/* ── 3. ACTIVE GAP FILL EXERCISE (Video PAUSED, Blank Shown, Mic Active) ── */}
+      {/* ── 3. ACTIVE GAP FILL EXERCISE (Hard Paused, Blank Shown, Mic Active) ── */}
       {gapState !== 'tracking' && gapState !== 'listening_loop' && exercise && (
         <div
           className="animate-fade-in"
@@ -503,31 +505,20 @@ export function VoiceGapFillMode() {
             gap: 12,
             padding: '16px 18px',
             borderRadius: 14,
-            background:
-              gapState === 'correct'
-                ? 'var(--success-bg)'
-                : gapState === 'incorrect'
-                ? 'var(--error-bg)'
-                : '#fef3c7',
-            border: `1.5px solid ${
-              gapState === 'correct'
-                ? 'var(--success)'
-                : gapState === 'incorrect'
-                ? 'var(--error)'
-                : '#f59e0b'
-            }`,
+            background: 'var(--bg-elevated)',
+            border: '1.5px solid var(--border-subtle)',
           }}
         >
           <div>
-            <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--accent-700)', textTransform: 'uppercase', marginBottom: 4, display: 'block' }}>
-              Fill in the Blank:
+            <span style={{ fontSize: 11, fontWeight: 800, color: 'var(--accent-700)', textTransform: 'uppercase', marginBottom: 4, display: 'block' }}>
+              Fill in the Blank (Video Hard Paused):
             </span>
             <p style={{ fontSize: 18, fontWeight: 750, color: 'var(--text-primary)', lineHeight: 1.4 }}>
               {gapState === 'revealed' || gapState === 'correct' ? (
                 <span>
                   {removeConsecutiveDuplicates(exercise.line.text).split(new RegExp(`(${exercise.targetWord})`, 'i')).map((part, i) =>
-                    normalizeWord(part) === normalizeWord(exercise.targetWord) ? (
-                      <span key={i} style={{ color: 'var(--success)', textDecoration: 'underline' }}>
+                    cleanWord(part) === cleanWord(exercise.targetWord) ? (
+                      <span key={i} style={{ color: '#16a34a', fontWeight: 800, textDecoration: 'underline', margin: '0 3px' }}>
                         {part}
                       </span>
                     ) : (
@@ -541,56 +532,14 @@ export function VoiceGapFillMode() {
             </p>
           </div>
 
-          {/* Voice input feedback */}
-          <div
-            style={{
-              padding: '10px 14px',
-              borderRadius: 10,
-              background: 'var(--bg-card)',
-              border: '1px solid var(--border-subtle)',
-              display: 'flex',
-              alignItems: 'center',
-              gap: 10,
-            }}
-          >
-            <div
-              style={{
-                width: 32,
-                height: 32,
-                borderRadius: '50%',
-                background: isListening ? '#fee2e2' : 'var(--bg-elevated)',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                flexShrink: 0,
-              }}
-            >
-              <Mic size={16} color={isListening ? '#ef4444' : 'var(--text-muted)'} className={isListening ? 'animate-pulse' : ''} />
-            </div>
-
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                {isListening ? 'Speak the missing German word…' : 'Heard word:'}
-              </div>
-              <div style={{ fontSize: 13.5, fontWeight: 600, color: 'var(--text-primary)' }}>
-                {lastSpoken || (isListening ? '…' : 'No word spoken yet')}
-              </div>
-            </div>
-          </div>
-
-          {gapState === 'correct' && (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--success)', fontSize: 13, fontWeight: 700 }}>
-              <CheckCircle2 size={16} />
-              <span>Richtig! The missing word was &quot;{exercise.targetWord}&quot;. Resuming…</span>
-            </div>
-          )}
-
-          {gapState === 'incorrect' && (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--error)', fontSize: 13, fontWeight: 650 }}>
-              <XCircle size={16} />
-              <span>Not quite. Try speaking the word again, or reveal it.</span>
-            </div>
-          )}
+          {/* Granular Word Diff & Mic Component */}
+          <WordDiffFeedback
+            diffResult={diffResult}
+            spokenText={spokenText || lastSpoken}
+            isListening={isListening}
+            onStopSpeaking={stopAndEvaluate}
+            passingThreshold={80}
+          />
 
           {gapState === 'revealed' && (
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--accent-700)', fontSize: 13, fontWeight: 650 }}>
@@ -614,13 +563,13 @@ export function VoiceGapFillMode() {
                     background: 'var(--accent-500)',
                     color: '#ffffff',
                     fontSize: 12,
-                    fontWeight: 650,
+                    fontWeight: 700,
                     border: 'none',
                     cursor: 'pointer',
                   }}
                 >
                   <RotateCcw size={13} />
-                  Try Again
+                  Try Speaking Again
                 </button>
                 <button
                   onClick={handleReveal}

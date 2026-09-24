@@ -9,14 +9,13 @@ import type { SpeechState } from '@/lib/types';
 interface UseSpeechRecognitionOptions {
   /**
    * BCP-47 language tag.
-   * CRITICAL: Must be 'de-DE' for accurate German pronunciation matching.
-   * Defaults to 'de-DE'.
+   * CRITICAL: Strictly 'de-DE' for German speech recognition.
    */
   lang?: string;
   continuous?: boolean;
   interimResults?: boolean;
-  /** Milliseconds of silence before auto-stopping recognition. */
-  silenceTimeoutMs?: number;
+  /** Milliseconds of complete silence before auto-evaluating. Default is 2500ms (2.5s). */
+  silenceDebounceMs?: number;
   onResult?: (transcript: string) => void;
   onError?: (error: string) => void;
 }
@@ -30,6 +29,7 @@ interface UseSpeechRecognitionReturn {
   isSupported: boolean;
   start: () => void;
   stop: () => void;
+  stopAndEvaluate: () => void;
   abort: () => void;
   reset: () => void;
 }
@@ -37,19 +37,21 @@ interface UseSpeechRecognitionReturn {
 // ─── Hook ─────────────────────────────────────────────────────────────────────
 
 export function useSpeechRecognition({
-  lang = 'de-DE', // ← CRITICAL: 'de-DE' ensures the browser listens for German
-  continuous = false,
+  lang = 'de-DE', // ← Strictly enforced German locale
+  continuous = true, // ← Continuous listening so micro-pauses don't cut off speech
   interimResults = true,
-  silenceTimeoutMs = 6000,
+  silenceDebounceMs = 2500, // ← Generous 2.5s silence buffer before auto-evaluating
   onResult,
   onError,
 }: UseSpeechRecognitionOptions = {}): UseSpeechRecognitionReturn {
   const recognitionRef = useRef<SpeechRecognition | null>(null);
-  const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const accumulatedTextRef = useRef<string>('');
+  const hasEvaluatedRef = useRef<boolean>(false);
   const onResultRef = useRef(onResult);
   const onErrorRef = useRef(onError);
 
-  // Keep callbacks fresh without re-creating the recognition instance
+  // Keep callbacks fresh without re-creating recognition instance
   useEffect(() => { onResultRef.current = onResult; }, [onResult]);
   useEffect(() => { onErrorRef.current = onError; }, [onError]);
 
@@ -62,12 +64,28 @@ export function useSpeechRecognition({
     typeof window !== 'undefined' &&
     ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window);
 
-  const clearSilenceTimer = useCallback(() => {
-    if (silenceTimerRef.current) {
-      clearTimeout(silenceTimerRef.current);
-      silenceTimerRef.current = null;
+  const clearDebounceTimer = useCallback(() => {
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+      debounceTimerRef.current = null;
     }
   }, []);
+
+  // Commits the evaluated speech to onResult and stops recognition
+  const commitEvaluation = useCallback((overrideText?: string) => {
+    clearDebounceTimer();
+    const textToCommit = (overrideText ?? accumulatedTextRef.current).trim();
+    if (!textToCommit || hasEvaluatedRef.current) return;
+
+    hasEvaluatedRef.current = true;
+    setSpokenText(textToCommit);
+    setSpeechState('processing');
+    onResultRef.current?.(textToCommit);
+
+    try {
+      recognitionRef.current?.stop();
+    } catch { /* ignore */ }
+  }, [clearDebounceTimer]);
 
   const buildRecognition = useCallback(() => {
     if (!isSupported) return null;
@@ -78,9 +96,9 @@ export function useSpeechRecognition({
 
     const rec: SpeechRecognition = new SpeechRecognitionCtor();
 
-    // ── CRITICAL: Set language to German ─────────────────────────────────────
-    rec.lang = lang;            // 'de-DE' — German (Germany)
-    rec.continuous = continuous;
+    // ── CRITICAL: Strictly enforce 'de-DE' German ────────────────────────────
+    rec.lang = 'de-DE';
+    rec.continuous = true; // Never auto-stop on first micro-pause
     rec.interimResults = interimResults;
     rec.maxAlternatives = 3;
 
@@ -88,42 +106,49 @@ export function useSpeechRecognition({
       setSpeechState('listening');
       setError(null);
       setInterimText('');
-      // Auto-stop after silence timeout
-      silenceTimerRef.current = setTimeout(() => rec.stop(), silenceTimeoutMs);
+      hasEvaluatedRef.current = false;
     };
 
     rec.onresult = (event: SpeechRecognitionEvent) => {
-      // Reset silence timer on any speech activity
-      clearSilenceTimer();
-      silenceTimerRef.current = setTimeout(() => rec.stop(), silenceTimeoutMs);
+      let finalChunk = '';
+      let interimChunk = '';
 
-      let finalText = '';
-      let interim = '';
-
-      for (let i = event.resultIndex; i < event.results.length; i++) {
+      for (let i = 0; i < event.results.length; i++) {
         const result = event.results[i];
         if (result.isFinal) {
-          finalText += result[0].transcript;
+          finalChunk += result[0].transcript + ' ';
         } else {
-          interim += result[0].transcript;
+          interimChunk += result[0].transcript;
         }
       }
 
-      if (interim) setInterimText(interim);
-      if (finalText) {
-        const trimmed = finalText.trim();
-        setSpokenText(trimmed);
-        setSpeechState('processing');
-        onResultRef.current?.(trimmed);
+      const totalHeard = (finalChunk + ' ' + interimChunk).trim();
+      if (totalHeard) {
+        accumulatedTextRef.current = totalHeard;
+        setSpokenText(totalHeard);
+        setInterimText(interimChunk);
+
+        // CLEAR TIMEOUT: Reset the countdown every time user speaks
+        clearDebounceTimer();
+
+        // SILENCE DEBOUNCE: Only evaluate after 2.5s of complete silence
+        debounceTimerRef.current = setTimeout(() => {
+          commitEvaluation(totalHeard);
+        }, silenceDebounceMs);
       }
     };
 
     rec.onerror = (event: SpeechRecognitionErrorEvent) => {
-      clearSilenceTimer();
+      clearDebounceTimer();
       let errorMsg: string;
       switch (event.error) {
         case 'no-speech':
-          errorMsg = 'No speech detected. Please try again.';
+          // If no speech at all was captured, don't break UI, just revert to idle
+          if (!accumulatedTextRef.current) {
+            setSpeechState('idle');
+            return;
+          }
+          errorMsg = 'No speech detected.';
           break;
         case 'not-allowed':
           errorMsg = 'Microphone access denied. Please allow microphone access.';
@@ -132,7 +157,6 @@ export function useSpeechRecognition({
           errorMsg = 'Network error. Speech recognition requires an internet connection.';
           break;
         case 'aborted':
-          // User aborted — not an error to surface
           setSpeechState('idle');
           return;
         default:
@@ -144,13 +168,18 @@ export function useSpeechRecognition({
     };
 
     rec.onend = () => {
-      clearSilenceTimer();
-      setSpeechState((prev) => (prev === 'listening' ? 'idle' : prev));
+      clearDebounceTimer();
+      // If we have uncommitted spoken words when engine closes, evaluate them now
+      if (accumulatedTextRef.current.trim() && !hasEvaluatedRef.current) {
+        commitEvaluation(accumulatedTextRef.current);
+      } else {
+        setSpeechState((prev) => (prev === 'listening' ? 'idle' : prev));
+      }
       setInterimText('');
     };
 
     return rec;
-  }, [lang, continuous, interimResults, silenceTimeoutMs, isSupported, clearSilenceTimer]);
+  }, [isSupported, interimResults, silenceDebounceMs, clearDebounceTimer, commitEvaluation]);
 
   // ── Public API ─────────────────────────────────────────────────────────────
   const start = useCallback(() => {
@@ -160,34 +189,54 @@ export function useSpeechRecognition({
       setSpeechState('error');
       return;
     }
-    // Abort any existing session first
+    clearDebounceTimer();
+    accumulatedTextRef.current = '';
+    hasEvaluatedRef.current = false;
+    setSpokenText('');
+    setInterimText('');
+
     if (recognitionRef.current) {
       try { recognitionRef.current.abort(); } catch { /* ignore */ }
     }
+
     const rec = buildRecognition();
     if (!rec) return;
     recognitionRef.current = rec;
-    setSpokenText('');
-    setInterimText('');
-    try { rec.start(); } catch (e) {
+
+    try {
+      rec.start();
+    } catch (e) {
       console.error('[useSpeechRecognition] start failed:', e);
     }
-  }, [isSupported, buildRecognition]);
+  }, [isSupported, buildRecognition, clearDebounceTimer]);
+
+  // Manual stop with immediate evaluation ("I'm Done Speaking" button)
+  const stopAndEvaluate = useCallback(() => {
+    if (accumulatedTextRef.current.trim()) {
+      commitEvaluation(accumulatedTextRef.current);
+    } else {
+      clearDebounceTimer();
+      try { recognitionRef.current?.stop(); } catch { /* ignore */ }
+      setSpeechState('idle');
+    }
+  }, [commitEvaluation, clearDebounceTimer]);
 
   const stop = useCallback(() => {
-    clearSilenceTimer();
-    try { recognitionRef.current?.stop(); } catch { /* ignore */ }
-  }, [clearSilenceTimer]);
+    stopAndEvaluate();
+  }, [stopAndEvaluate]);
 
   const abort = useCallback(() => {
-    clearSilenceTimer();
+    clearDebounceTimer();
+    hasEvaluatedRef.current = true;
     try { recognitionRef.current?.abort(); } catch { /* ignore */ }
     setSpeechState('idle');
     setInterimText('');
-  }, [clearSilenceTimer]);
+  }, [clearDebounceTimer]);
 
   const reset = useCallback(() => {
     abort();
+    accumulatedTextRef.current = '';
+    hasEvaluatedRef.current = false;
     setSpokenText('');
     setInterimText('');
     setError(null);
@@ -196,10 +245,10 @@ export function useSpeechRecognition({
 
   useEffect(() => {
     return () => {
-      clearSilenceTimer();
+      clearDebounceTimer();
       try { recognitionRef.current?.abort(); } catch { /* ignore */ }
     };
-  }, [clearSilenceTimer]);
+  }, [clearDebounceTimer]);
 
   return {
     spokenText,
@@ -210,6 +259,7 @@ export function useSpeechRecognition({
     isSupported,
     start,
     stop,
+    stopAndEvaluate,
     abort,
     reset,
   };

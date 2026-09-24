@@ -1,32 +1,49 @@
 'use client';
 
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { Users, VolumeX, Volume2, Mic, Play, Sparkles, CheckCircle2 } from 'lucide-react';
+import { Users, Volume2, Mic, Play, RotateCcw, SkipForward, CheckCircle2, XCircle } from 'lucide-react';
 import { useAppStore } from '@/store/appStore';
 import { useSpeechRecognition } from '@/hooks/useSpeechRecognition';
 import { getGlobalPlayer } from '@/components/player/VideoPlayer';
-import { removeConsecutiveDuplicates, similarityRatio, MATCH_THRESHOLD } from '@/lib/transcript';
+import { removeConsecutiveDuplicates, diffSentenceWords, type WordDiffResult } from '@/lib/transcript';
+import { WordDiffFeedback } from './WordDiffFeedback';
+
+type RolePlayState =
+  | 'partner_listening' // Partner's turn: video plays normally and unmuted
+  | 'user_speaking'     // User's turn: video HARD PAUSED, unlimited time to speak
+  | 'evaluating'        // Evaluating speech against target
+  | 'passed'            // >= 80% word match, auto-resumes video
+  | 'retry';            // < 80% word match: video remains PAUSED, prompts retry
 
 export function RolePlayMode() {
   const { transcript, currentTimeSec } = useAppStore();
 
-  // User chooses which speaker role to play: 0 = Speaker A, 1 = Speaker B
+  // User selects role: 0 = Speaker A, 1 = Speaker B
   const [userRole, setUserRole] = useState<0 | 1>(0);
+  const [roleState, setRoleState] = useState<RolePlayState>('partner_listening');
+  const [activeUserLineIdx, setActiveUserLineIdx] = useState<number>(-1);
+  const [diffResult, setDiffResult] = useState<WordDiffResult | null>(null);
   const [lastSpoken, setLastSpoken] = useState('');
-  const [similarity, setSimilarity] = useState(0);
 
-  const lastMuteStateRef = useRef<boolean | null>(null);
-  const lastSpokenLineIndexRef = useRef<number>(-1);
+  const handledLinesSetRef = useRef<Set<number>>(new Set());
+  const autoResumeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastTimeMsRef = useRef<number>(0);
+  const isMountedRef = useRef(true);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      if (autoResumeTimerRef.current) clearTimeout(autoResumeTimerRef.current);
+    };
+  }, []);
 
   // Find active line based on current playback time
   const currentLineInfo = useMemo(() => {
     const timeMs = currentTimeSec * 1000;
     const index = transcript.findIndex((l) => timeMs >= l.offset && timeMs <= l.offset + l.duration);
-    if (index === -1) {
-      // Small gap between sentences
-      return null;
-    }
-    const speaker = (index % 2) as 0 | 1; // Alternating dialogue turns
+    if (index === -1) return null;
+    const speaker = (index % 2) as 0 | 1;
     return {
       line: transcript[index],
       index,
@@ -35,79 +52,178 @@ export function RolePlayMode() {
     };
   }, [transcript, currentTimeSec, userRole]);
 
-  // Speech Recognition for user's turn
+  // Target sentence for active line
+  const activeLine = activeUserLineIdx >= 0 && transcript[activeUserLineIdx]
+    ? transcript[activeUserLineIdx]
+    : currentLineInfo?.line || null;
+
+  const targetClean = activeLine ? removeConsecutiveDuplicates(activeLine.text) : '';
+
+  // ── Speech Recognition Evaluation (Granular 80% Word Matching) ─────────────
   const handleResult = useCallback(
     (spoken: string) => {
-      if (!currentLineInfo?.line) return;
+      if (!isMountedRef.current || !targetClean) return;
+
       const cleanSpoken = removeConsecutiveDuplicates(spoken);
-      const cleanTarget = removeConsecutiveDuplicates(currentLineInfo.line.text);
-      const sim = similarityRatio(cleanSpoken, cleanTarget);
       setLastSpoken(spoken);
-      setSimilarity(sim);
+
+      const diff = diffSentenceWords(cleanSpoken, targetClean);
+      setDiffResult(diff);
+
+      if (diff.isPassing) {
+        // Correct (>= 80%): Show green feedback and resume playback
+        setRoleState('passed');
+        if (activeUserLineIdx >= 0) {
+          handledLinesSetRef.current.add(activeUserLineIdx);
+        }
+
+        if (autoResumeTimerRef.current) clearTimeout(autoResumeTimerRef.current);
+        autoResumeTimerRef.current = setTimeout(() => {
+          if (!isMountedRef.current) return;
+          try {
+            const player = getGlobalPlayer();
+            player?.unMute();
+            player?.playVideo();
+          } catch (e) {
+            console.warn('Resume video failed:', e);
+          }
+          setRoleState('partner_listening');
+          setActiveUserLineIdx(-1);
+          setDiffResult(null);
+          setLastSpoken('');
+        }, 1600);
+      } else {
+        // Fails (< 80%): STRICT PROGRESSION - Video MUST REMAIN PAUSED!
+        setRoleState('retry');
+        try {
+          getGlobalPlayer()?.pauseVideo();
+        } catch { /* ignore */ }
+      }
     },
-    [currentLineInfo],
+    [targetClean, activeUserLineIdx],
   );
 
-  const { start, abort, isListening } = useSpeechRecognition({
-    lang: 'de-DE',
-    continuous: true,
-    silenceTimeoutMs: 10000,
+  const { start, abort, stopAndEvaluate, isListening, spokenText } = useSpeechRecognition({
+    lang: 'de-DE', // Strictly German locale
+    continuous: true, // Continuous listening
+    silenceDebounceMs: 2500, // 2.5s silence buffer
     onResult: handleResult,
   });
 
-  // Unmute and abort mic on unmount
+  // ── TRIGGER USER TURN (Hard Pause & Open Mic) ──────────────────────────────
+  const triggerUserTurn = useCallback(
+    (lineIdx: number) => {
+      if (handledLinesSetRef.current.has(lineIdx)) return;
+
+      setActiveUserLineIdx(lineIdx);
+      setRoleState('user_speaking');
+      setDiffResult(null);
+      setLastSpoken('');
+
+      // 1. HARD PAUSE the YouTube video
+      try {
+        const player = getGlobalPlayer();
+        player?.pauseVideo();
+      } catch (err) {
+        console.warn('Error pausing player for user turn:', err);
+      }
+
+      // 2. Activate microphone with de-DE and generous silence debounce
+      try {
+        start();
+      } catch (err) {
+        console.warn('Error starting speech recognition:', err);
+      }
+    },
+    [start],
+  );
+
+  // ── PLAYBACK MONITORING ───────────────────────────────────────────────────
+  useEffect(() => {
+    if (!transcript.length) return;
+
+    const timeMs = currentTimeSec * 1000;
+    const prevTimeMs = lastTimeMsRef.current;
+    lastTimeMsRef.current = timeMs;
+
+    // Reset handled set on backward seek
+    if (timeMs < prevTimeMs - 2000) {
+      handledLinesSetRef.current.clear();
+    }
+
+    // Only inspect playback when not already paused waiting for speech
+    if (roleState !== 'partner_listening') return;
+
+    for (let i = 0; i < transcript.length; i++) {
+      const line = transcript[i];
+      const speaker = (i % 2) as 0 | 1;
+      const isUser = speaker === userRole;
+
+      if (!isUser) continue; // Partner line: let video play normally
+
+      // User line reached: HARD PAUSE immediately
+      const isNearStart = timeMs >= line.offset && timeMs <= line.offset + line.duration;
+      if (isNearStart && !handledLinesSetRef.current.has(i)) {
+        triggerUserTurn(i);
+        break;
+      }
+    }
+  }, [currentTimeSec, transcript, userRole, roleState, triggerUserTurn]);
+
+  // Clean unmount
   useEffect(() => {
     return () => {
       try {
         const player = getGlobalPlayer();
         player?.unMute();
-        lastMuteStateRef.current = false;
-        abort();
-      } catch (err) {
-        console.warn('RolePlay unmount error:', err);
-      }
+      } catch { /* ignore */ }
+      abort();
     };
   }, [abort]);
 
-  // Actively control mute and microphone based on speaker turn
-  useEffect(() => {
-    const player = getGlobalPlayer();
-    const isUserTurn = Boolean(currentLineInfo?.isUserTurn);
+  const handleRetrySpeaking = () => {
+    setRoleState('user_speaking');
+    setDiffResult(null);
+    setLastSpoken('');
+    start();
+  };
 
-    // 1. Mute YouTube audio when it is user's turn; Unmute for partner
-    if (player && lastMuteStateRef.current !== isUserTurn) {
+  const handleReplayUserAudio = () => {
+    if (activeUserLineIdx >= 0 && transcript[activeUserLineIdx]) {
+      const line = transcript[activeUserLineIdx];
+      const player = getGlobalPlayer();
       try {
-        if (isUserTurn) {
-          player.mute();
-          lastMuteStateRef.current = true;
-        } else {
-          player.unMute();
-          lastMuteStateRef.current = false;
-        }
-      } catch (err) {
-        console.warn('Player mute/unMute call failed:', err);
-      }
-    }
+        player?.unMute();
+        player?.seekTo(line.offset / 1000, true);
+        player?.playVideo();
+      } catch { /* ignore */ }
 
-    // 2. Activate Web Speech API mic when it is user's turn; Stop when partner speaks
-    if (isUserTurn) {
-      if (currentLineInfo && lastSpokenLineIndexRef.current !== currentLineInfo.index) {
-        lastSpokenLineIndexRef.current = currentLineInfo.index;
-        setLastSpoken('');
-        setSimilarity(0);
+      // Let user listen once, then pause again for speaking
+      setTimeout(() => {
         try {
-          start();
+          player?.pauseVideo();
         } catch { /* ignore */ }
-      }
-    } else {
-      if (lastSpokenLineIndexRef.current !== -1) {
-        lastSpokenLineIndexRef.current = -1;
-        abort();
-      }
+        handleRetrySpeaking();
+      }, line.duration + 200);
     }
-  }, [currentLineInfo, start, abort]);
+  };
 
-  const targetClean = currentLineInfo?.line ? removeConsecutiveDuplicates(currentLineInfo.line.text) : '';
+  const handleSkipTurn = () => {
+    if (autoResumeTimerRef.current) clearTimeout(autoResumeTimerRef.current);
+    if (activeUserLineIdx >= 0) {
+      handledLinesSetRef.current.add(activeUserLineIdx);
+    }
+    abort();
+    try {
+      const player = getGlobalPlayer();
+      player?.unMute();
+      player?.playVideo();
+    } catch { /* ignore */ }
+    setRoleState('partner_listening');
+    setActiveUserLineIdx(-1);
+    setDiffResult(null);
+    setLastSpoken('');
+  };
 
   return (
     <div
@@ -144,7 +260,7 @@ export function RolePlayMode() {
               Role-Play Dialogue Practice
             </h3>
             <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-              Auto-mutes video and activates your microphone on your lines
+              Strict Progression: Video hard-pauses on your lines until 80% word match is achieved
             </span>
           </div>
         </div>
@@ -153,26 +269,26 @@ export function RolePlayMode() {
         <span
           style={{
             fontSize: 11,
-            fontWeight: 700,
+            fontWeight: 750,
             padding: '4px 10px',
             borderRadius: 8,
-            background: currentLineInfo?.isUserTurn ? '#fee2e2' : 'var(--accent-50)',
-            color: currentLineInfo?.isUserTurn ? '#b91c1c' : 'var(--accent-700)',
+            background: roleState !== 'partner_listening' ? '#fef3c7' : 'var(--accent-50)',
+            color: roleState !== 'partner_listening' ? '#b45309' : 'var(--accent-700)',
             display: 'inline-flex',
             alignItems: 'center',
             gap: 5,
-            border: `1px solid ${currentLineInfo?.isUserTurn ? '#fecdd3' : 'var(--accent-200)'}`,
+            border: `1px solid ${roleState !== 'partner_listening' ? '#fde68a' : 'var(--accent-200)'}`,
           }}
         >
-          {currentLineInfo?.isUserTurn ? (
+          {roleState !== 'partner_listening' ? (
             <>
               <Mic size={13} className="animate-pulse" />
-              <span>RECORDING YOUR LINES (MUTED)</span>
+              <span>YOUR TURN (VIDEO PAUSED)</span>
             </>
           ) : (
             <>
               <Volume2 size={13} />
-              <span>PARTNER SPEAKING (AUDIO ACTIVE)</span>
+              <span>PARTNER SPEAKING (VIDEO PLAYING)</span>
             </>
           )}
         </span>
@@ -192,8 +308,8 @@ export function RolePlayMode() {
         <button
           onClick={() => {
             setUserRole(0);
-            lastMuteStateRef.current = null;
-            lastSpokenLineIndexRef.current = -1;
+            handledLinesSetRef.current.clear();
+            setRoleState('partner_listening');
             abort();
           }}
           style={{
@@ -210,13 +326,13 @@ export function RolePlayMode() {
             transition: 'all 0.15s ease',
           }}
         >
-          🎭 Play Speaker A (Mute A & Record)
+          🎭 Play Speaker A (Pause on A & speak)
         </button>
         <button
           onClick={() => {
             setUserRole(1);
-            lastMuteStateRef.current = null;
-            lastSpokenLineIndexRef.current = -1;
+            handledLinesSetRef.current.clear();
+            setRoleState('partner_listening');
             abort();
           }}
           style={{
@@ -233,135 +349,176 @@ export function RolePlayMode() {
             transition: 'all 0.15s ease',
           }}
         >
-          🎭 Play Speaker B (Mute B & Record)
+          🎭 Play Speaker B (Pause on B & speak)
         </button>
       </div>
 
-      {/* Active Dialogue Turn Card */}
-      <div
-        style={{
-          padding: '16px 18px',
-          borderRadius: 14,
-          background: currentLineInfo?.isUserTurn ? '#fff1f2' : 'var(--bg-elevated)',
-          border: `1.5px solid ${currentLineInfo?.isUserTurn ? '#fecdd3' : 'var(--border-subtle)'}`,
-          transition: 'all 0.2s ease',
-          display: 'flex',
-          flexDirection: 'column',
-          gap: 12,
-        }}
-      >
-        {currentLineInfo ? (
-          <>
-            <div>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-                <span
-                  style={{
-                    fontSize: 11,
-                    fontWeight: 700,
-                    textTransform: 'uppercase',
-                    color: currentLineInfo.isUserTurn ? '#e11d48' : 'var(--accent-600)',
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 5,
-                  }}
-                >
-                  {currentLineInfo.isUserTurn ? <Mic size={13} className="animate-pulse" /> : <Volume2 size={13} />}
-                  {currentLineInfo.isUserTurn ? 'YOUR TURN — READ ALOUD NOW' : 'PARTNER TURN — LISTEN'}
-                  {' '}- Speaker {currentLineInfo.speaker === 0 ? 'A' : 'B'}
-                </span>
-
-                {currentLineInfo.isUserTurn && isListening && (
-                  <span
-                    style={{
-                      fontSize: 10.5,
-                      fontWeight: 750,
-                      color: '#e11d48',
-                      background: '#fee2e2',
-                      padding: '2px 8px',
-                      borderRadius: 6,
-                    }}
-                  >
-                    🔴 Microphone Active (de-DE)
-                  </span>
-                )}
-              </div>
-
-              <p
+      {/* ── 1. PARTNER'S TURN (Playing normally) ── */}
+      {roleState === 'partner_listening' && (
+        <div
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 10,
+            padding: '14px 16px',
+            background: 'var(--bg-elevated)',
+            borderRadius: 14,
+            border: '1px solid var(--border-subtle)',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase' }}>
+              Partner Speaking (Listen Closely):
+            </span>
+            {currentLineInfo && currentLineInfo.isUserTurn && (
+              <button
+                onClick={() => triggerUserTurn(currentLineInfo.index)}
                 style={{
-                  fontSize: 18,
-                  fontWeight: 750,
-                  color: currentLineInfo.isUserTurn ? '#9f1239' : 'var(--text-primary)',
-                  lineHeight: 1.35,
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 5,
+                  padding: '4px 10px',
+                  borderRadius: 8,
+                  background: 'var(--accent-500)',
+                  color: '#ffffff',
+                  fontSize: 11.5,
+                  fontWeight: 650,
+                  border: 'none',
+                  cursor: 'pointer',
                 }}
               >
-                {targetClean}
-              </p>
-            </div>
+                <Mic size={12} />
+                Pause & Practice Line Now
+              </button>
+            )}
+          </div>
 
-            {/* Live Mic Speech Transcript when it's user's turn */}
-            {currentLineInfo.isUserTurn && (
-              <div
+          <p style={{ fontSize: 16, fontWeight: 650, color: 'var(--text-primary)', lineHeight: 1.4 }}>
+            {currentLineInfo
+              ? removeConsecutiveDuplicates(currentLineInfo.line.text)
+              : 'Playing video… will automatically pause when it is your dialogue turn'}
+          </p>
+        </div>
+      )}
+
+      {/* ── 2. USER'S TURN (Hard Pause, Unlimited Speaking Time, Granular Feedback) ── */}
+      {roleState !== 'partner_listening' && activeLine && (
+        <div
+          className="animate-fade-in"
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 12,
+            padding: '16px 18px',
+            borderRadius: 14,
+            background: 'var(--bg-elevated)',
+            border: '1.5px solid var(--border-subtle)',
+          }}
+        >
+          <div>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+              <span
                 style={{
-                  padding: '10px 14px',
-                  borderRadius: 10,
-                  background: 'var(--bg-card)',
-                  border: '1px solid var(--border-subtle)',
+                  fontSize: 11,
+                  fontWeight: 800,
+                  color: 'var(--accent-600)',
+                  textTransform: 'uppercase',
                   display: 'flex',
                   alignItems: 'center',
-                  gap: 10,
+                  gap: 5,
                 }}
               >
-                <div
-                  style={{
-                    width: 32,
-                    height: 32,
-                    borderRadius: '50%',
-                    background: '#fee2e2',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    flexShrink: 0,
-                  }}
-                >
-                  <Mic size={16} color="#ef4444" className="animate-pulse" />
-                </div>
+                <Mic size={13} className="animate-pulse" />
+                <span>YOUR DIALOGUE TURN (VIDEO HARD PAUSED)</span>
+              </span>
 
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 11, color: '#ef4444', fontWeight: 650 }}>
-                    Recording your pronunciation:
-                  </div>
-                  <div style={{ fontSize: 13.5, fontWeight: 600, color: 'var(--text-primary)' }}>
-                    {lastSpoken || 'Speak the German line now…'}
-                  </div>
-                </div>
+              <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)' }}>
+                Unlimited time to speak
+              </span>
+            </div>
 
-                {similarity > 0 && (
-                  <span
-                    style={{
-                      fontSize: 12,
-                      fontWeight: 700,
-                      color: similarity >= MATCH_THRESHOLD ? 'var(--success)' : 'var(--accent-600)',
-                    }}
-                  >
-                    {Math.round(similarity * 100)}% match
-                  </span>
-                )}
-              </div>
-            )}
-
-            {currentLineInfo.isUserTurn && similarity >= MATCH_THRESHOLD && (
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--success)', fontSize: 12.5, fontWeight: 700 }}>
-                <CheckCircle2 size={15} />
-                <span>Ausgezeichnet! Great pronunciation.</span>
-              </div>
-            )}
-          </>
-        ) : (
-          <div style={{ textAlign: 'center', padding: '12px 0', color: 'var(--text-muted)', fontSize: 13 }}>
-            Play the video to begin dialogue role-play. YouTube player audio auto-mutes on your lines and records your speech!
+            <p style={{ fontSize: 18, fontWeight: 750, color: 'var(--text-primary)', lineHeight: 1.35 }}>
+              {targetClean}
+            </p>
           </div>
-        )}
-      </div>
+
+          {/* Granular Word-by-Word Diff & Mic Component */}
+          <WordDiffFeedback
+            diffResult={diffResult}
+            spokenText={spokenText || lastSpoken}
+            isListening={isListening}
+            onStopSpeaking={stopAndEvaluate}
+            passingThreshold={80}
+          />
+
+          {/* Action buttons (Try Again, Replay Audio, Skip) */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
+            {roleState === 'retry' && (
+              <button
+                onClick={handleRetrySpeaking}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 5,
+                  padding: '7px 14px',
+                  borderRadius: 8,
+                  background: 'var(--accent-500)',
+                  color: '#ffffff',
+                  fontSize: 12,
+                  fontWeight: 700,
+                  border: 'none',
+                  cursor: 'pointer',
+                  boxShadow: 'var(--shadow-xs)',
+                }}
+              >
+                <RotateCcw size={13} />
+                Try Speaking Again
+              </button>
+            )}
+
+            <button
+              onClick={handleReplayUserAudio}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 5,
+                padding: '7px 12px',
+                borderRadius: 8,
+                background: 'var(--bg-card)',
+                color: 'var(--text-secondary)',
+                border: '1px solid var(--border-default)',
+                fontSize: 12,
+                fontWeight: 600,
+                cursor: 'pointer',
+              }}
+            >
+              <Volume2 size={12} />
+              Replay Audio
+            </button>
+
+            <button
+              onClick={handleSkipTurn}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 5,
+                padding: '7px 12px',
+                borderRadius: 8,
+                background: 'var(--bg-card)',
+                color: 'var(--text-secondary)',
+                border: '1px solid var(--border-default)',
+                fontSize: 12,
+                fontWeight: 600,
+                cursor: 'pointer',
+                marginLeft: 'auto',
+              }}
+            >
+              <span>Skip to Partner</span>
+              <SkipForward size={12} />
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

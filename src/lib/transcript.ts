@@ -66,9 +66,137 @@ export function similarityRatio(spoken: string, target: string): number {
 
 /**
  * Threshold at which we consider a spoken utterance "correct".
- * 0.70 = at least 70% similarity.
+ * 0.80 = at least 80% word match.
  */
-export const MATCH_THRESHOLD = 0.70;
+export const MATCH_THRESHOLD = 0.80;
+
+// ─── Word-by-Word Diffing & Alignment ─────────────────────────────────────────
+
+export interface SpokenWordDiff {
+  word: string;
+  isCorrect: boolean;
+}
+
+export interface WordDiffResult {
+  score: number; // 0 - 100
+  isPassing: boolean; // score >= 80
+  spokenDiffs: SpokenWordDiff[];
+  missingWords: string[];
+  matchedWordsCount: number;
+  totalTargetWords: number;
+}
+
+/** Clean a single word for matching, keeping German umlauts and letters */
+export function cleanWord(w: string): string {
+  if (!w) return '';
+  return w
+    .toLowerCase()
+    .replace(/[.,!?;:"""''„"«»()[\]{}]/g, '')
+    .trim();
+}
+
+/** Compare two German words with fuzzy edit-distance tolerance for Speech API quirks */
+export function wordsMatch(spoken: string, target: string): boolean {
+  const s = cleanWord(spoken);
+  const t = cleanWord(target);
+  if (!s || !t) return false;
+  if (s === t) return true;
+  // Allow small edit distance tolerance for minor recognition quirks (e.g., ß vs ss)
+  const maxDist = t.length <= 4 ? 1 : 2;
+  return levenshtein(s, t) <= maxDist;
+}
+
+/**
+ * Word-by-word diffing between user's spoken transcript and target sentence.
+ * Returns granular status for each word (green vs. red bold) and fair 80% passing evaluation.
+ */
+export function diffSentenceWords(spokenText: string, targetText: string): WordDiffResult {
+  const cleanSpokenText = removeConsecutiveDuplicates(spokenText);
+  const cleanTargetText = removeConsecutiveDuplicates(targetText);
+
+  const spokenTokens = cleanSpokenText.split(/\s+/).filter(Boolean);
+  const targetTokens = cleanTargetText.split(/\s+/).filter(Boolean);
+
+  if (targetTokens.length === 0) {
+    return {
+      score: 100,
+      isPassing: true,
+      spokenDiffs: spokenTokens.map((w) => ({ word: w, isCorrect: true })),
+      missingWords: [],
+      matchedWordsCount: 0,
+      totalTargetWords: 0,
+    };
+  }
+
+  if (spokenTokens.length === 0) {
+    return {
+      score: 0,
+      isPassing: false,
+      spokenDiffs: [],
+      missingWords: targetTokens,
+      matchedWordsCount: 0,
+      totalTargetWords: targetTokens.length,
+    };
+  }
+
+  const n = targetTokens.length;
+  const m = spokenTokens.length;
+
+  // DP table for Longest Common Subsequence of words
+  const dp: number[][] = Array.from({ length: n + 1 }, () => Array(m + 1).fill(0));
+
+  for (let i = 1; i <= n; i++) {
+    for (let j = 1; j <= m; j++) {
+      if (wordsMatch(spokenTokens[j - 1], targetTokens[i - 1])) {
+        dp[i][j] = dp[i - 1][j - 1] + 1;
+      } else {
+        dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+      }
+    }
+  }
+
+  // Backtrack to find aligned matches
+  let i = n;
+  let j = m;
+  const spokenMatches = new Set<number>();
+  const targetMatches = new Set<number>();
+
+  while (i > 0 && j > 0) {
+    if (wordsMatch(spokenTokens[j - 1], targetTokens[i - 1]) && dp[i][j] === dp[i - 1][j - 1] + 1) {
+      spokenMatches.add(j - 1);
+      targetMatches.add(i - 1);
+      i--;
+      j--;
+    } else if (dp[i - 1][j] >= dp[i][j - 1]) {
+      i--;
+    } else {
+      j--;
+    }
+  }
+
+  const spokenDiffs: SpokenWordDiff[] = spokenTokens.map((word, idx) => ({
+    word,
+    isCorrect: spokenMatches.has(idx),
+  }));
+
+  const missingWords: string[] = targetTokens.filter((_, idx) => !targetMatches.has(idx));
+  const matchedWordsCount = targetMatches.size;
+
+  // Fair 80% word match calculation:
+  const maxWords = Math.max(targetTokens.length, spokenTokens.length);
+  const ratio = maxWords > 0 ? matchedWordsCount / maxWords : 0;
+  const score = Math.round(ratio * 100);
+  const isPassing = score >= 80;
+
+  return {
+    score,
+    isPassing,
+    spokenDiffs,
+    missingWords,
+    matchedWordsCount,
+    totalTargetWords: targetTokens.length,
+  };
+}
 
 // ─── Gap-Fill Helpers ─────────────────────────────────────────────────────────
 
