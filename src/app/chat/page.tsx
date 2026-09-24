@@ -1,98 +1,41 @@
 'use client';
 
-import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
-import Link from 'next/link';
-import { Send, Volume2, Bot, User, Sparkles, RotateCcw, ArrowLeft, MessageSquare } from 'lucide-react';
+import { useState, useRef, useEffect, useCallback } from 'react';
+import { Send, Volume2, Bot, RotateCcw, Sparkles, AlertCircle } from 'lucide-react';
 import { Header } from '@/components/layout/Header';
 import { UmlautKeyboard } from '@/components/player/LearningModes/UmlautKeyboard';
-import { useBookmarks } from '@/hooks/useBookmarks';
-import { getStoredGlobalPhrases } from '@/lib/globalPhrases';
-import { useAppStore } from '@/store/appStore';
 
 interface ChatMessage {
   id: string;
   sender: 'user' | 'bot';
   text: string;
   time: string;
-  matchedKeyword?: string;
+  isError?: boolean;
 }
 
-const FALLBACK_GERMAN_DIALOGUE = [
-  'Hallo! Wie kann ich dir heute beim Deutschlernen helfen?',
-  'Mir geht es sehr gut, danke der Nachfrage! Und wie läuft dein Tag?',
-  'Das ist wirklich eine interessante Frage.',
-  'Auf jeden Fall! Da stimme ich dir absolut zu.',
-  'Ich lerne auch jeden Tag Neues dazu. Deutsch macht Spaß!',
-  'Was machst du heute noch Schönes?',
-  'Schön, von dir zu hören! Welches Thema möchtest du heute üben?',
-  'Das verstehe ich vollkommen. Übung macht den Meister!',
-  'Hast du heute schon die Videos im Player geschaut?',
-  'Vielen Dank fürs Gespräch! Lass uns weiter auf Deutsch schreiben.',
-  'Genau so ist es! Du machst schon tolle Fortschritte.',
-  'Ich habe keine Zweifel daran, dass du das schaffst.',
+const INITIAL_BOT_MESSAGE: ChatMessage = {
+  id: 'welcome',
+  sender: 'bot',
+  text: 'Hallo! Ich bin dein AI-Lernpartner für Deutsch (A1). Ich helfe dir beim Sprechen und Üben. Wie heißt du und wie geht es dir heute?',
+  time: 'Jetzt',
+};
+
+const CONVERSATION_STARTERS = [
+  'Hallo! Wie geht es dir?',
+  'Ich heiße Alex.',
+  'Ich lerne seit zwei Wochen Deutsch.',
+  'Was machst du heute?',
+  'Ich trinke gerne einen Kaffee.',
+  'Woher kommst du?',
 ];
 
 export default function ChatPage() {
-  const { bookmarks } = useBookmarks();
-  const { transcript, repeatedSentences } = useAppStore();
-
   const [inputMessage, setInputMessage] = useState('');
   const [isTyping, setIsTyping] = useState(false);
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      id: 'welcome',
-      sender: 'bot',
-      text: 'Hallo! Ich bin dein AI-Lernpartner. Schreib mir einfach auf Deutsch — ich antworte mit echten Sätzen aus deinen gelernten Videos!',
-      time: 'Jetzt',
-    },
-  ]);
+  const [messages, setMessages] = useState<ChatMessage[]>([INITIAL_BOT_MESSAGE]);
 
   const inputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-
-  // Pool of all saved sentences from bookmarks, global phrases, and repeated sentences
-  const sentencePool = useMemo(() => {
-    const set = new Set<string>();
-
-    // 1. User's saved bookmarks
-    for (const b of bookmarks) {
-      if (b.sentence && b.sentence.trim().length > 4) {
-        set.add(b.sentence.trim());
-      }
-    }
-
-    // 2. Global common phrases from studied videos
-    try {
-      const stored = getStoredGlobalPhrases();
-      for (const key of Object.keys(stored)) {
-        const text = stored[key]?.originalText;
-        if (text && text.trim().length > 4) {
-          set.add(text.trim());
-        }
-      }
-    } catch { /* ignore */ }
-
-    // 3. Repeated sentences from current video
-    for (const r of repeatedSentences) {
-      if (r.text && r.text.trim().length > 4) {
-        set.add(r.text.trim());
-      }
-    }
-
-    // 4. Current transcript
-    for (const t of transcript.slice(0, 30)) {
-      if (t.text && t.text.trim().length > 6) {
-        set.add(t.text.trim());
-      }
-    }
-
-    // 5. Authentic fallback sentences
-    for (const f of FALLBACK_GERMAN_DIALOGUE) {
-      set.add(f);
-    }
-
-    return Array.from(set);
-  }, [bookmarks, repeatedSentences, transcript]);
 
   // Auto-scroll to bottom
   const scrollToBottom = useCallback(() => {
@@ -103,46 +46,8 @@ export default function ChatPage() {
     scrollToBottom();
   }, [messages, isTyping, scrollToBottom]);
 
-  // Client-side Bot response logic
-  const findBotReply = useCallback((userText: string): { reply: string; keyword?: string } => {
-    const clean = userText.toLowerCase().replace(/[.,!?;:"""''„]/g, '');
-    const userWords = clean.split(/\s+/).filter((w) => w.length >= 3);
-
-    // 1. Try keyword matching in sentence pool
-    let bestMatch: string | null = null;
-    let maxOverlap = 0;
-    let matchedWord: string | undefined = undefined;
-
-    for (const sentence of sentencePool) {
-      const sentenceLower = sentence.toLowerCase();
-      let overlap = 0;
-      let lastWord = '';
-
-      for (const word of userWords) {
-        if (sentenceLower.includes(word)) {
-          overlap++;
-          lastWord = word;
-        }
-      }
-
-      if (overlap > maxOverlap) {
-        maxOverlap = overlap;
-        bestMatch = sentence;
-        matchedWord = lastWord;
-      }
-    }
-
-    if (bestMatch && maxOverlap > 0) {
-      return { reply: bestMatch, keyword: matchedWord };
-    }
-
-    // 2. Pick a random sentence from the user's saved vocabulary pool
-    const randomIndex = Math.floor(Math.random() * sentencePool.length);
-    return { reply: sentencePool[randomIndex] || 'Das ist sehr interessant!' };
-  }, [sentencePool]);
-
-  // Handle Send
-  const handleSendMessage = (textToSend?: string) => {
+  // Handle Send with real OpenAI LLM API route
+  const handleSendMessage = async (textToSend?: string) => {
     const text = (textToSend || inputMessage).trim();
     if (!text || isTyping) return;
 
@@ -154,24 +59,58 @@ export default function ChatPage() {
       time: timeStr,
     };
 
-    setMessages((prev) => [...prev, userMsg]);
+    // Construct conversation history payload for LLM context
+    const currentMessages = [...messages, userMsg];
+    setMessages(currentMessages);
     setInputMessage('');
     setIsTyping(true);
 
-    // Simulate natural thinking delay (500ms - 800ms)
-    setTimeout(() => {
-      const { reply, keyword } = findBotReply(text);
+    try {
+      const historyPayload = currentMessages
+        .filter((m) => !m.isError)
+        .map((m) => ({
+          role: m.sender === 'user' ? ('user' as const) : ('assistant' as const),
+          content: m.text,
+        }));
+
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ messages: historyPayload }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.error || `Fehler ${res.status}: Konnte keine Antwort generieren.`);
+      }
+
+      const botReply = data.reply;
       const botMsg: ChatMessage = {
         id: `bot-${Date.now()}`,
         sender: 'bot',
-        text: reply,
+        text: botReply,
         time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        matchedKeyword: keyword,
       };
+
       setMessages((prev) => [...prev, botMsg]);
+    } catch (err: unknown) {
+      console.error('[ChatPage] Error:', err);
+      const errMsg = err instanceof Error ? err.message : 'Verbindungsfehler';
+      const errorBotMsg: ChatMessage = {
+        id: `bot-err-${Date.now()}`,
+        sender: 'bot',
+        text: `⚠️ ${errMsg}`,
+        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        isError: true,
+      };
+      setMessages((prev) => [...prev, errorBotMsg]);
+    } finally {
       setIsTyping(false);
-      setTimeout(() => inputRef.current?.focus(), 50);
-    }, 650);
+      setTimeout(() => inputRef.current?.focus(), 60);
+    }
   };
 
   // Text-To-Speech for German bot lines
@@ -180,7 +119,7 @@ export default function ChatPage() {
     window.speechSynthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.lang = 'de-DE';
-    utterance.rate = 0.95;
+    utterance.rate = 0.92;
     window.speechSynthesis.speak(utterance);
   };
 
@@ -189,10 +128,11 @@ export default function ChatPage() {
       {
         id: `welcome-${Date.now()}`,
         sender: 'bot',
-        text: 'Chat zurückgesetzt. Schreib mir etwas auf Deutsch!',
+        text: 'Chat zurückgesetzt! Lass uns von vorne beginnen: Wie geht es dir heute?',
         time: 'Jetzt',
       },
     ]);
+    setTimeout(() => inputRef.current?.focus(), 60);
   };
 
   return (
@@ -228,18 +168,18 @@ export default function ChatPage() {
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
             <div
               style={{
-                width: 38,
-                height: 38,
+                width: 40,
+                height: 40,
                 borderRadius: 12,
                 background: 'linear-gradient(135deg,#10b981,#059669)',
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
                 color: '#fff',
-                boxShadow: '0 2px 6px rgba(16,185,129,0.3)',
+                boxShadow: '0 2px 8px rgba(16,185,129,0.3)',
               }}
             >
-              <Bot size={20} />
+              <Bot size={22} />
             </div>
             <div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -250,18 +190,22 @@ export default function ChatPage() {
                   style={{
                     fontSize: 10.5,
                     fontWeight: 750,
-                    padding: '1px 7px',
+                    padding: '2px 8px',
                     borderRadius: 99,
                     background: 'rgba(16,185,129,0.12)',
                     color: '#059669',
                     border: '1px solid rgba(16,185,129,0.3)',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 4,
                   }}
                 >
-                  Online · 100% Free
+                  <Sparkles size={11} />
+                  A1 Live Partner
                 </span>
               </div>
               <p style={{ fontSize: 11.5, color: 'var(--text-muted)', margin: '2px 0 0' }}>
-                Replies using vocabulary from your {sentencePool.length} saved video sentences
+                Echte Konversation mit sanfter Grammatik-Korrektur &amp; Anschlussfragen
               </p>
             </div>
           </div>
@@ -269,12 +213,12 @@ export default function ChatPage() {
           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             <button
               onClick={clearChat}
-              title="Reset conversation"
+              title="Gespräch neu starten"
               style={{
                 display: 'inline-flex',
                 alignItems: 'center',
                 gap: 5,
-                padding: '6px 11px',
+                padding: '6px 12px',
                 borderRadius: 8,
                 border: '1px solid var(--border-default)',
                 background: 'var(--bg-elevated)',
@@ -283,6 +227,7 @@ export default function ChatPage() {
                 fontWeight: 600,
                 cursor: 'pointer',
                 fontFamily: 'inherit',
+                transition: 'all 0.15s ease',
               }}
             >
               <RotateCcw size={12} />
@@ -302,29 +247,29 @@ export default function ChatPage() {
             whiteSpace: 'nowrap',
           }}
         >
-          {['Wie geht es dir?', 'Was machst du heute?', 'Auf jeden Fall!', 'Hast du Geschwister?', 'Ich lerne Deutsch.'].map(
-            (starter) => (
-              <button
-                key={starter}
-                onClick={() => handleSendMessage(starter)}
-                style={{
-                  padding: '5px 11px',
-                  borderRadius: 20,
-                  border: '1px solid var(--border-subtle)',
-                  background: 'var(--bg-card)',
-                  color: 'var(--accent-600)',
-                  fontSize: 12,
-                  fontWeight: 650,
-                  cursor: 'pointer',
-                  fontFamily: 'inherit',
-                  transition: 'all 0.12s ease',
-                  flexShrink: 0,
-                }}
-              >
-                💬 {starter}
-              </button>
-            ),
-          )}
+          {CONVERSATION_STARTERS.map((starter) => (
+            <button
+              key={starter}
+              onClick={() => handleSendMessage(starter)}
+              disabled={isTyping}
+              style={{
+                padding: '5px 12px',
+                borderRadius: 20,
+                border: '1px solid var(--border-subtle)',
+                background: 'var(--bg-card)',
+                color: 'var(--accent-600)',
+                fontSize: 12,
+                fontWeight: 650,
+                cursor: isTyping ? 'default' : 'pointer',
+                fontFamily: 'inherit',
+                transition: 'all 0.12s ease',
+                flexShrink: 0,
+                opacity: isTyping ? 0.6 : 1,
+              }}
+            >
+              💬 {starter}
+            </button>
+          ))}
         </div>
 
         {/* WhatsApp-Style Chat Container */}
@@ -362,7 +307,7 @@ export default function ChatPage() {
                       width: 28,
                       height: 28,
                       borderRadius: '50%',
-                      background: '#10b981',
+                      background: m.isError ? '#ef4444' : '#10b981',
                       display: 'flex',
                       alignItems: 'center',
                       justifyContent: 'center',
@@ -370,27 +315,45 @@ export default function ChatPage() {
                       flexShrink: 0,
                     }}
                   >
-                    <Bot size={15} />
+                    {m.isError ? <AlertCircle size={15} /> : <Bot size={15} />}
                   </div>
                 )}
 
                 <div
                   style={{
-                    maxWidth: '75%',
+                    maxWidth: '78%',
                     borderRadius: isUser ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
                     padding: '10px 14px',
                     background: isUser
                       ? 'linear-gradient(135deg,#059669,#10b981)'
-                      : 'var(--bg-card)',
-                    color: isUser ? '#ffffff' : 'var(--text-primary)',
-                    border: isUser ? 'none' : '1px solid var(--border-subtle)',
+                      : m.isError
+                        ? 'rgba(239, 68, 68, 0.08)'
+                        : 'var(--bg-card)',
+                    color: isUser
+                      ? '#ffffff'
+                      : m.isError
+                        ? '#dc2626'
+                        : 'var(--text-primary)',
+                    border: isUser
+                      ? 'none'
+                      : m.isError
+                        ? '1px solid rgba(239, 68, 68, 0.3)'
+                        : '1px solid var(--border-subtle)',
                     boxShadow: 'var(--shadow-xs)',
                     display: 'flex',
                     flexDirection: 'column',
                     gap: 4,
                   }}
                 >
-                  <div style={{ fontSize: 14, fontWeight: 500, lineHeight: 1.45, wordBreak: 'break-word' }}>
+                  <div
+                    style={{
+                      fontSize: 14,
+                      fontWeight: 500,
+                      lineHeight: 1.45,
+                      wordBreak: 'break-word',
+                      whiteSpace: 'pre-wrap',
+                    }}
+                  >
                     {m.text}
                   </div>
 
@@ -405,10 +368,10 @@ export default function ChatPage() {
                       marginTop: 2,
                     }}
                   >
-                    {!isUser && (
+                    {!isUser && !m.isError && (
                       <button
                         onClick={() => speakGerman(m.text)}
-                        title="Listen in German"
+                        title="Diesen Satz auf Deutsch anhören"
                         style={{
                           background: 'none',
                           border: 'none',
@@ -426,7 +389,7 @@ export default function ChatPage() {
                         <span>Hören</span>
                       </button>
                     )}
-                    <span>{m.time}</span>
+                    <span style={{ marginLeft: 'auto' }}>{m.time}</span>
                   </div>
                 </div>
               </div>
@@ -463,7 +426,7 @@ export default function ChatPage() {
                   color: 'var(--text-muted)',
                 }}
               >
-                <span>Tippt</span>
+                <span>Partner antwortet</span>
                 <span className="animate-pulse">…</span>
               </div>
             </div>
@@ -497,6 +460,7 @@ export default function ChatPage() {
                 if (e.key === 'Enter') handleSendMessage();
               }}
               placeholder="Schreib etwas auf Deutsch… (z.B. Wie geht es dir?)"
+              disabled={isTyping}
               style={{
                 flex: 1,
                 padding: '10px 14px',
@@ -538,14 +502,14 @@ export default function ChatPage() {
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 6 }}>
             <UmlautKeyboard
               inputRef={inputRef}
-              onInsert={(ch) => {
+              onInsert={() => {
                 setTimeout(() => {
                   if (inputRef.current) setInputMessage(inputRef.current.value);
                 }, 10);
               }}
             />
             <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-              Press <strong>Enter ↵</strong> to send
+              Drücke <strong>Enter ↵</strong> zum Senden
             </span>
           </div>
         </div>
