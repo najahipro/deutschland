@@ -1,8 +1,8 @@
 'use client';
 
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import Image from 'next/image';
-import { Play, Clock, Check, Sparkles, History as HistoryIcon, RefreshCw } from 'lucide-react';
+import { Play, Clock, Check, Sparkles, History as HistoryIcon, RefreshCw, Loader2, ChevronDown } from 'lucide-react';
 import { useAppStore } from '@/store/appStore';
 import { useVideoHistory } from '@/hooks/useVideoHistory';
 import { relativeDate } from '@/lib/transcript';
@@ -24,33 +24,83 @@ export function HomeFeed() {
 
   const [activeCategory, setActiveCategory] = useState(0);
   const [feedVideos, setFeedVideos] = useState<VideoItem[]>([]);
+  const [nextPageToken, setNextPageToken] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const sentinelRef = useRef<HTMLDivElement>(null);
 
   const fetchFeed = useCallback(async (query: string) => {
     setIsLoading(true);
     setError(null);
+    setNextPageToken(null);
     try {
-      const res = await fetch(`/api/youtube/search?q=${encodeURIComponent(query)}&maxResults=24`);
+      const res = await fetch(`/api/youtube/search?q=${encodeURIComponent(query)}&maxResults=50`);
       const data = await res.json();
       if (data.error) {
         setError(data.error);
         setFeedVideos([]);
+        setNextPageToken(null);
       } else {
         setFeedVideos((data.videos as VideoItem[]) ?? []);
+        setNextPageToken(data.nextPageToken || null);
       }
     } catch (err) {
       console.error('[HomeFeed] Failed to fetch feed:', err);
       setError('Could not connect to YouTube API.');
       setFeedVideos([]);
+      setNextPageToken(null);
     } finally {
       setIsLoading(false);
     }
   }, []);
 
+  const loadMoreFeed = useCallback(async () => {
+    if (!nextPageToken || isLoadingMore || isLoading) return;
+    setIsLoadingMore(true);
+    try {
+      const currentQuery = CATEGORIES[activeCategory].query;
+      const res = await fetch(
+        `/api/youtube/search?q=${encodeURIComponent(currentQuery)}&maxResults=50&pageToken=${encodeURIComponent(nextPageToken)}`,
+      );
+      const data = await res.json();
+      if (data.videos) {
+        const newVids = (data.videos as VideoItem[]) ?? [];
+        setFeedVideos((prev) => {
+          const ids = new Set(prev.map((v) => v.id));
+          return [...prev, ...newVids.filter((v) => !ids.has(v.id))];
+        });
+        setNextPageToken(data.nextPageToken || null);
+      }
+    } catch (err) {
+      console.error('[HomeFeed] Failed to load more feed videos:', err);
+    } finally {
+      setIsLoadingMore(false);
+    }
+  }, [nextPageToken, isLoadingMore, isLoading, activeCategory]);
+
   useEffect(() => {
     fetchFeed(CATEGORIES[activeCategory].query);
   }, [activeCategory, fetchFeed]);
+
+  // Infinite Scroll Intersection Observer
+  useEffect(() => {
+    const sentinel = sentinelRef.current;
+    if (!sentinel || !nextPageToken || isLoadingMore) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting) {
+          loadMoreFeed();
+        }
+      },
+      { rootMargin: '300px', threshold: 0.1 },
+    );
+
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [loadMoreFeed, nextPageToken, isLoadingMore]);
 
   const handleVideoSelect = (video: VideoItem) => {
     resetPlayerState();
@@ -263,13 +313,68 @@ export function HomeFeed() {
           >
             {feedVideos.map((video, idx) => (
               <FeedVideoCard
-                key={video.id}
+                key={`${video.id}-${idx}`}
                 video={video}
                 index={idx}
                 isWatched={isInHistory(video.id)}
                 onClick={() => handleVideoSelect(video)}
               />
             ))}
+          </div>
+        )}
+
+        {/* Infinite Scroll Sentinel & Load More button */}
+        {feedVideos.length > 0 && (
+          <div
+            style={{
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'center',
+              padding: '24px 16px 40px',
+              gap: 12,
+            }}
+          >
+            {nextPageToken ? (
+              <>
+                <div ref={sentinelRef} style={{ height: 10, width: '100%' }} />
+                <button
+                  onClick={loadMoreFeed}
+                  disabled={isLoadingMore}
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 8,
+                    padding: '9px 20px',
+                    borderRadius: 'var(--radius-full)',
+                    border: '1.5px solid var(--accent-300)',
+                    background: 'var(--bg-card)',
+                    color: 'var(--accent-600)',
+                    fontSize: 13,
+                    fontWeight: 700,
+                    cursor: isLoadingMore ? 'not-allowed' : 'pointer',
+                    boxShadow: 'var(--shadow-sm)',
+                    transition: 'all 0.16s ease',
+                  }}
+                >
+                  {isLoadingMore ? (
+                    <>
+                      <Loader2 size={15} style={{ animation: 'spin 1s linear infinite' }} />
+                      <span>Loading more German videos…</span>
+                    </>
+                  ) : (
+                    <>
+                      <ChevronDown size={15} />
+                      <span>Load More Videos ({feedVideos.length} loaded)</span>
+                    </>
+                  )}
+                </button>
+              </>
+            ) : (
+              <p style={{ fontSize: 12, color: 'var(--text-muted)', fontWeight: 500 }}>
+                ✓ All available recommended videos loaded ({feedVideos.length} videos)
+              </p>
+            )}
           </div>
         )}
       </section>

@@ -24,6 +24,7 @@ export function SearchBar() {
     async (q: string) => {
       if (!q.trim()) {
         setSearchResults([]);
+        useAppStore.getState().setNextPageToken(null);
         setShowResults(false);
         return;
       }
@@ -31,18 +32,21 @@ export function SearchBar() {
       setShowResults(true);
       try {
         const res = await fetch(
-          `/api/youtube/search?q=${encodeURIComponent(q)}&maxResults=24`,
+          `/api/youtube/search?q=${encodeURIComponent(q)}&maxResults=50`,
         );
         const data = await res.json();
         if (data.error) {
           console.error('[SearchBar] API error:', data.error);
           setSearchResults([]);
+          useAppStore.getState().setNextPageToken(null);
         } else {
           setSearchResults((data.videos as VideoItem[]) ?? []);
+          useAppStore.getState().setNextPageToken(data.nextPageToken || null);
         }
       } catch (err) {
         console.error('[SearchBar] fetch failed:', err);
         setSearchResults([]);
+        useAppStore.getState().setNextPageToken(null);
       } finally {
         setIsSearching(false);
       }

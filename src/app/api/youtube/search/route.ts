@@ -6,8 +6,9 @@ export const runtime = 'nodejs';
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const q = searchParams.get('q')?.trim();
-  const rawMax = Number(searchParams.get('maxResults') ?? 24);
-  const maxResults = Math.min(Math.max(isNaN(rawMax) ? 24 : rawMax, 24), 50);
+  const pageToken = searchParams.get('pageToken')?.trim() || undefined;
+  const rawMax = Number(searchParams.get('maxResults') ?? 50);
+  const maxResults = Math.min(Math.max(isNaN(rawMax) ? 50 : rawMax, 1), 50);
 
   if (!q) {
     return NextResponse.json<SearchApiResponse>(
@@ -34,6 +35,9 @@ export async function GET(req: NextRequest) {
     searchUrl.searchParams.set('q', q);
     searchUrl.searchParams.set('type', 'video');
     searchUrl.searchParams.set('maxResults', String(maxResults));
+    if (pageToken) {
+      searchUrl.searchParams.set('pageToken', pageToken);
+    }
     searchUrl.searchParams.set('key', apiKey);
 
     const res = await fetch(searchUrl.toString(), {
@@ -53,6 +57,7 @@ export async function GET(req: NextRequest) {
     const data = await res.json();
     const rawItems = (data.items as YoutubeApiItem[]) || [];
     const validItems = rawItems.filter((item) => item?.id?.videoId);
+    const nextPageToken = (data.nextPageToken as string) || null;
 
     // Extract video IDs for secondary call to contentDetails (durations)
     const videoIds = validItems.map((item) => item.id.videoId);
@@ -98,7 +103,7 @@ export async function GET(req: NextRequest) {
         '',
     }));
 
-    return NextResponse.json<SearchApiResponse>({ videos });
+    return NextResponse.json<SearchApiResponse>({ videos, nextPageToken });
   } catch (err) {
     console.error('[api/youtube/search]', err);
     return NextResponse.json<SearchApiResponse>(

@@ -74,6 +74,7 @@ export interface YoutubeApiItem {
 /** Response shape from our internal /api/youtube/search endpoint */
 export interface SearchApiResponse {
   videos: VideoItem[];
+  nextPageToken?: string | null;
   error?: string;
 }
 

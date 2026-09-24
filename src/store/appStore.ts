@@ -22,8 +22,13 @@ interface AppState {
   setSearchQuery: (q: string) => void;
   isSearching: boolean;
   setIsSearching: (v: boolean) => void;
+  isLoadingMore: boolean;
+  setIsLoadingMore: (v: boolean) => void;
   searchResults: VideoItem[];
   setSearchResults: (results: VideoItem[]) => void;
+  nextPageToken: string | null;
+  setNextPageToken: (token: string | null) => void;
+  appendSearchResults: (newVideos: VideoItem[], nextToken: string | null) => void;
   showResults: boolean;
   setShowResults: (v: boolean) => void;
 
@@ -103,8 +108,21 @@ export const useAppStore = create<AppState>((set) => ({
   setSearchQuery: (q) => set({ searchQuery: q }),
   isSearching: false,
   setIsSearching: (v) => set({ isSearching: v }),
+  isLoadingMore: false,
+  setIsLoadingMore: (v) => set({ isLoadingMore: v }),
   searchResults: [],
   setSearchResults: (results) => set({ searchResults: results }),
+  nextPageToken: null,
+  setNextPageToken: (token) => set({ nextPageToken: token }),
+  appendSearchResults: (newVideos, nextToken) =>
+    set((state) => {
+      const existingIds = new Set(state.searchResults.map((v) => v.id));
+      const filtered = newVideos.filter((v) => !existingIds.has(v.id));
+      return {
+        searchResults: [...state.searchResults, ...filtered],
+        nextPageToken: nextToken,
+      };
+    }),
   showResults: false,
   setShowResults: (v) => set({ showResults: v }),
 
