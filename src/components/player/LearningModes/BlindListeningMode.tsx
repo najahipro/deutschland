@@ -3,21 +3,21 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import {
   Ear, Eye, EyeOff, Mic, RotateCcw,
-  SkipForward, Volume2, Headphones,
+  SkipForward, Volume2, Headphones, Sparkles,
 } from 'lucide-react';
 import { useAppStore } from '@/store/appStore';
 import { useSpeechRecognition } from '@/hooks/useSpeechRecognition';
-import { removeConsecutiveDuplicates, diffSentenceWords, type WordDiffResult } from '@/lib/transcript';
+import { removeConsecutiveDuplicates, diffSentenceWords, type WordDiffResult, stripTrailingArticles } from '@/lib/transcript';
 import { getGlobalPlayer } from '@/components/player/VideoPlayer';
 import { WordDiffFeedback } from './WordDiffFeedback';
 
 type BlindState =
   | 'tracking'        // watching with subtitles blacked out
-  | 'listening_loop'  // listen-only replay phase
+  | 'listening_loop'  // listen-only replay phase with blacked out subtitles
   | 'listening'       // video HARD PAUSED at sentence end, microphone active (de-DE)
-  | 'correct'         // accurate repetition >= 80%
+  | 'correct'         // accurate repetition >= 80%: reveals subtitle, auto-advances
   | 'incorrect'       // repetition < 80%: video stays PAUSED, prompts retry
-  | 'revealed';       // subtitle revealed
+  | 'revealed';       // subtitle revealed on request
 
 export function BlindListeningMode() {
   const { transcript, currentTimeSec, prepLoopTarget, setPrepLoopTarget } = useAppStore();
@@ -30,13 +30,16 @@ export function BlindListeningMode() {
   const [lastSpoken, setLastSpoken] = useState('');
 
   const loopTarget = prepLoopTarget || 1;
-  const lastTimeMsRef = useRef<number>(0);
-  const lastTriggeredIdxRef = useRef<number>(-1);
   const autoResumeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const seekingRef = useRef<boolean>(false);
   const isMountedRef = useRef(true);
 
-  const normalizedTarget = useMemo(() => removeConsecutiveDuplicates(activeLine), [activeLine]);
+  // Target sentence with consecutive duplicate stutter words and trailing dangling articles removed
+  const normalizedTarget = useMemo(() => {
+    const deduped = removeConsecutiveDuplicates(activeLine);
+    const { cleanText } = stripTrailingArticles(deduped);
+    return cleanText || deduped;
+  }, [activeLine]);
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -46,7 +49,72 @@ export function BlindListeningMode() {
     };
   }, []);
 
-  // ── Speech Recognition Evaluation (Granular 80% Word Matching) ─────────────
+  const handleResultRef = useRef<(spoken: string) => void>(() => {});
+
+  const { start, abort, stopAndEvaluate, isListening, spokenText } = useSpeechRecognition({
+    lang: 'de-DE',
+    continuous: true,
+    silenceDebounceMs: 2200,
+    onResult: (spoken) => handleResultRef.current(spoken),
+  });
+
+  // ── 1. START BLIND LOOP CYCLE FOR A GIVEN SEGMENT ───────────────────────────
+  const startLoopForSegment = useCallback(
+    (index: number) => {
+      if (!isMountedRef.current || !transcript || !transcript[index]) return;
+      if (autoResumeTimerRef.current) clearTimeout(autoResumeTimerRef.current);
+
+      try {
+        abort();
+      } catch { /* ignore */ }
+
+      const line = transcript[index];
+      const { cleanText } = stripTrailingArticles(line.text);
+      const targetText = cleanText || line.text;
+
+      setActiveLine(targetText);
+      setActiveLineIndex(index);
+      setCurrentLoop(1);
+      setDiffResult(null);
+      setLastSpoken('');
+      setBlindState('listening_loop');
+
+      seekingRef.current = true;
+      setTimeout(() => {
+        seekingRef.current = false;
+      }, 400);
+
+      const player = getGlobalPlayer();
+      player?.seekTo(line.offset / 1000, true);
+      player?.playVideo();
+    },
+    [transcript, abort],
+  );
+
+  // ── 2. AUTOMATIC HARD PAUSE & MIC ACTIVATION ────────────────────────────────
+  const triggerActiveListening = useCallback(() => {
+    if (autoResumeTimerRef.current) clearTimeout(autoResumeTimerRef.current);
+
+    // 1. Immediately HARD PAUSE YouTube video
+    try {
+      getGlobalPlayer()?.pauseVideo();
+    } catch (err) {
+      console.warn('Could not pause player in BlindListening:', err);
+    }
+
+    // 2. Automatically activate microphone without waiting for user click
+    setBlindState('listening');
+    setDiffResult(null);
+    setLastSpoken('');
+
+    try {
+      start();
+    } catch (err) {
+      console.warn('Speech recognition start error in BlindListening:', err);
+    }
+  }, [start]);
+
+  // ── 3. SPEECH EVALUATION & AUTOMATIC ADVANCEMENT ────────────────────────────
   const handleResult = useCallback(
     (spoken: string) => {
       if (!isMountedRef.current || !normalizedTarget) return;
@@ -58,17 +126,21 @@ export function BlindListeningMode() {
       setDiffResult(diff);
 
       if (diff.isPassing) {
-        // Correct (>= 80%): Reveal subtitle and auto-resume
+        // Correct (>= 80%): Reveal subtitle and AUTOMATICALLY advance to NEXT segment
         setBlindState('correct');
         if (autoResumeTimerRef.current) clearTimeout(autoResumeTimerRef.current);
+
         autoResumeTimerRef.current = setTimeout(() => {
           if (!isMountedRef.current) return;
-          getGlobalPlayer()?.playVideo();
-          setBlindState('tracking');
-          setLastSpoken('');
-          setDiffResult(null);
-          setCurrentLoop(1);
-        }, 1800);
+          const nextIndex = activeLineIndex + 1;
+          if (nextIndex < transcript.length) {
+            // FIX THE RESET BUG: Automatically advance to NEXT sentence, unpause, and begin loop cycle
+            startLoopForSegment(nextIndex);
+          } else {
+            getGlobalPlayer()?.playVideo();
+            setBlindState('tracking');
+          }
+        }, 1500);
       } else {
         // Failed (< 80%): Video stays PAUSED, prompts retry
         setBlindState('incorrect');
@@ -77,114 +149,57 @@ export function BlindListeningMode() {
         } catch { /* ignore */ }
       }
     },
-    [normalizedTarget],
+    [normalizedTarget, activeLineIndex, transcript.length, startLoopForSegment],
   );
 
-  const { start, abort, stopAndEvaluate, isListening, spokenText } = useSpeechRecognition({
-    lang: 'de-DE', // Strictly German locale
-    continuous: true, // Continuous listening
-    silenceDebounceMs: 2500, // 2.5s silence buffer
-    onResult: handleResult,
-  });
+  useEffect(() => {
+    handleResultRef.current = handleResult;
+  }, [handleResult]);
 
-  // ── HARD PAUSE VIDEO & ACTIVATE MICROPHONE IMMEDIATELY ─────────────────────
-  const pauseAndActivateMic = useCallback(
-    (lineText: string, index: number) => {
-      if (autoResumeTimerRef.current) clearTimeout(autoResumeTimerRef.current);
-
-      // 1. Immediately HARD PAUSE YouTube player
-      const player = getGlobalPlayer();
-      try {
-        player?.pauseVideo();
-      } catch (err) {
-        console.warn('Error pausing player in BlindListening:', err);
-      }
-
-      // 2. Set active line and state
-      setActiveLine(lineText);
-      setActiveLineIndex(index);
-      setLastSpoken('');
-      setDiffResult(null);
-      setBlindState('listening');
-
-      // 3. Trigger continuous speech recognition (de-DE)
-      try {
-        start();
-      } catch (err) {
-        console.warn('Error starting speech recognition in BlindListening:', err);
-      }
-    },
-    [start],
-  );
-
-  // ── PRECISE TIME TRACKING & PAUSE TRIGGER ─────────────────────────────────
+  // ── 4. AUTO-LOOP & AUTO-PAUSE DETECTION ENGINE ──────────────────────────────
   useEffect(() => {
     if (!transcript.length) return;
 
-    const timeMs = currentTimeSec * 1000;
-    const prevTimeMs = lastTimeMsRef.current;
-    lastTimeMsRef.current = timeMs;
-
-    // Detect seek backward: allow re-triggering
-    if (timeMs < prevTimeMs - 2000) {
-      lastTriggeredIdxRef.current = -1;
-      seekingRef.current = false;
+    // Initial Auto-Start: pick segment based on current playhead or start from segment 0
+    if (activeLineIndex === -1) {
+      const timeMs = currentTimeSec * 1000;
+      const foundIdx = transcript.findIndex((l) => timeMs >= l.offset && timeMs < l.offset + l.duration);
+      const initialIdx = foundIdx !== -1 ? foundIdx : 0;
+      startLoopForSegment(initialIdx);
+      return;
     }
 
-    // 1. TRACKING MODE: Watch playback until sentence reaches its end
-    if (blindState === 'tracking') {
-      for (let i = 0; i < transcript.length; i++) {
-        const line = transcript[i];
-        const lineStart = line.offset;
-        const lineEnd = line.offset + line.duration;
+    if (blindState !== 'listening_loop' || activeLineIndex < 0) return;
 
-        const reachedEnd = timeMs >= lineEnd - 120 && timeMs <= lineEnd + 800;
-        const crossed = prevTimeMs < lineEnd && timeMs >= lineEnd - 120;
+    const line = transcript[activeLineIndex];
+    if (!line) return;
 
-        if ((reachedEnd || crossed) && lastTriggeredIdxRef.current !== i) {
-          lastTriggeredIdxRef.current = i;
+    const lineStart = line.offset / 1000;
+    const lineEnd = (line.offset + line.duration) / 1000;
 
-          if (loopTarget > 1) {
-            setActiveLine(line.text);
-            setActiveLineIndex(i);
-            setCurrentLoop(1);
-            setBlindState('listening_loop');
-            seekingRef.current = true;
-            getGlobalPlayer()?.seekTo(lineStart / 1000, true);
-            getGlobalPlayer()?.playVideo();
-          } else {
-            pauseAndActivateMic(line.text, i);
-          }
-          break;
-        }
+    if (seekingRef.current) {
+      if (currentTimeSec >= lineStart - 0.2 && currentTimeSec < lineEnd - 0.2) {
+        seekingRef.current = false;
       }
+      return;
     }
 
-    // 2. LISTEN-ONLY LOOP MODE: Replay N times, then hard-pause and open mic
-    if (blindState === 'listening_loop' && activeLineIndex >= 0) {
-      const line = transcript[activeLineIndex];
-      if (line) {
-        const lineStart = line.offset / 1000;
-        const lineEnd = (line.offset + line.duration) / 1000;
+    const timeMs = currentTimeSec * 1000;
+    const reachedEnd = currentTimeSec >= lineEnd - 0.15 || timeMs >= line.offset + line.duration - 120;
 
-        if (seekingRef.current) {
-          if (currentTimeSec >= lineStart && currentTimeSec < lineEnd - 0.2) {
-            seekingRef.current = false;
-          }
-          return;
-        }
-
-        if (currentTimeSec >= lineEnd - 0.12 || (timeMs >= line.offset + line.duration - 120)) {
-          if (currentLoop < loopTarget) {
-            setCurrentLoop((prev) => prev + 1);
-            seekingRef.current = true;
-            getGlobalPlayer()?.seekTo(lineStart, true);
-            getGlobalPlayer()?.playVideo();
-          } else {
-            // Finished defined loops: HARD PAUSE VIDEO IMMEDIATELY & START MIC
-            pauseAndActivateMic(line.text, activeLineIndex);
-          }
-        }
+    if (reachedEnd) {
+      if (currentLoop < loopTarget) {
+        // Automatic loop repetition: increment loop and seek back to sentence start
+        setCurrentLoop((prev) => prev + 1);
+        seekingRef.current = true;
+        setTimeout(() => {
+          seekingRef.current = false;
+        }, 400);
+        getGlobalPlayer()?.seekTo(lineStart, true);
+        getGlobalPlayer()?.playVideo();
+      } else {
+        // Exact end of the loopTarget-th playback: AUTOMATIC HARD-PAUSE & AUTOMATIC MIC ACTIVATION!
+        triggerActiveListening();
       }
     }
   }, [
@@ -194,38 +209,35 @@ export function BlindListeningMode() {
     activeLineIndex,
     currentLoop,
     loopTarget,
-    pauseAndActivateMic,
+    startLoopForSegment,
+    triggerActiveListening,
   ]);
-
-  const currentPlayingLine = useMemo(() => {
-    const timeMs = currentTimeSec * 1000;
-    return transcript.find((l) => timeMs >= l.offset && timeMs <= l.offset + l.duration) || null;
-  }, [transcript, currentTimeSec]);
 
   const handleSkip = () => {
     if (autoResumeTimerRef.current) clearTimeout(autoResumeTimerRef.current);
     abort();
-    getGlobalPlayer()?.playVideo();
-    setBlindState('tracking');
-    setLastSpoken('');
-    setDiffResult(null);
-    setCurrentLoop(1);
+    const nextIndex = activeLineIndex + 1;
+    if (nextIndex < transcript.length) {
+      startLoopForSegment(nextIndex);
+    } else {
+      getGlobalPlayer()?.playVideo();
+      setBlindState('tracking');
+    }
   };
 
   const handleRetry = () => {
     setLastSpoken('');
     setDiffResult(null);
     setBlindState('listening');
+    try {
+      getGlobalPlayer()?.pauseVideo();
+    } catch { /* ignore */ }
     start();
   };
 
   const handleReplayAudio = () => {
-    if (activeLineIndex >= 0 && transcript[activeLineIndex]) {
-      const line = transcript[activeLineIndex];
-      getGlobalPlayer()?.seekTo(line.offset / 1000, true);
-      getGlobalPlayer()?.playVideo();
-      setCurrentLoop(1);
-      setBlindState('listening_loop');
+    if (activeLineIndex >= 0) {
+      startLoopForSegment(activeLineIndex);
     }
   };
 
@@ -268,12 +280,12 @@ export function BlindListeningMode() {
               Blind Listening Mode
             </h3>
             <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-              Subtitles 100% blacked out · Video hard-pauses at sentence end for repetition
+              Auto-loops {loopTarget}× blind · Auto-pauses &amp; opens mic · Auto-advances on ≥ 80% match
             </span>
           </div>
         </div>
 
-        {/* Status Badge */}
+        {/* Status Badge & Loop Selector */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 3, background: 'var(--bg-elevated)', padding: '2px 6px', borderRadius: 8 }}>
             <span style={{ fontSize: 10.5, fontWeight: 600, color: 'var(--text-muted)' }}>Loops:</span>
@@ -304,86 +316,50 @@ export function BlindListeningMode() {
               padding: '4px 10px',
               borderRadius: 8,
               background:
-                blindState === 'listening' || blindState === 'incorrect'
+                blindState === 'correct'
+                  ? 'rgba(16, 185, 129, 0.12)'
+                  : blindState === 'listening' || blindState === 'incorrect'
                   ? '#fef3c7'
                   : '#111827',
               color:
-                blindState === 'listening' || blindState === 'incorrect'
+                blindState === 'correct'
+                  ? '#059669'
+                  : blindState === 'listening' || blindState === 'incorrect'
                   ? '#b45309'
                   : '#fbbf24',
               display: 'inline-flex',
               alignItems: 'center',
               gap: 5,
-              border: `1px solid ${blindState === 'listening' || blindState === 'incorrect' ? '#fde68a' : '#374151'}`,
+              border: `1px solid ${
+                blindState === 'correct'
+                  ? 'rgba(16, 185, 129, 0.3)'
+                  : blindState === 'listening' || blindState === 'incorrect'
+                  ? '#fde68a'
+                  : '#374151'
+              }`,
             }}
           >
-            {blindState === 'listening' || blindState === 'incorrect' ? (
+            {blindState === 'correct' ? (
+              <>
+                <Sparkles size={12} color="#059669" />
+                <span>PASSED! AUTO-ADVANCING…</span>
+              </>
+            ) : blindState === 'listening' || blindState === 'incorrect' ? (
               <>
                 <Mic size={12} className="animate-pulse" />
-                <span>VIDEO HARD PAUSED — SPEAK NOW</span>
+                <span>MIC ACTIVE — SPEAK NOW</span>
               </>
             ) : (
               <>
                 <EyeOff size={12} />
-                <span>SUBTITLES BLACKED OUT</span>
+                <span>BLIND LOOP {currentLoop}/{loopTarget}</span>
               </>
             )}
           </span>
         </div>
       </div>
 
-      {/* ── 1. TRACKING PLAYBACK ── */}
-      {blindState === 'tracking' && (
-        <div
-          style={{
-            padding: '24px 20px',
-            borderRadius: 14,
-            background: 'var(--bg-elevated)',
-            border: '1.5px dashed var(--border-default)',
-            textAlign: 'center',
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            gap: 10,
-          }}
-        >
-          <Ear size={26} color="var(--accent-500)" />
-          <div>
-            <p style={{ fontSize: 14.5, fontWeight: 700, color: 'var(--text-primary)' }}>
-              Listening Strictly By Ear…
-            </p>
-            <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 3 }}>
-              When this German sentence ends, the video will automatically hard-pause and activate your microphone!
-            </p>
-          </div>
-
-          {currentPlayingLine && (
-            <button
-              onClick={() => pauseAndActivateMic(currentPlayingLine.text, transcript.indexOf(currentPlayingLine))}
-              style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: 6,
-                padding: '6px 14px',
-                borderRadius: 8,
-                background: 'var(--accent-500)',
-                color: '#ffffff',
-                fontSize: 12,
-                fontWeight: 700,
-                border: 'none',
-                cursor: 'pointer',
-                boxShadow: 'var(--shadow-xs)',
-                marginTop: 4,
-              }}
-            >
-              <Mic size={13} />
-              <span>Pause & Record Speech Now</span>
-            </button>
-          )}
-        </div>
-      )}
-
-      {/* ── 2. LISTEN LOOPING ── */}
+      {/* ── LISTEN LOOPING (SUBTITLES 100% BLACKED OUT) ── */}
       {blindState === 'listening_loop' && (
         <div
           className="animate-fade-in"
@@ -405,7 +381,8 @@ export function BlindListeningMode() {
               </span>
             </div>
             <button
-              onClick={() => pauseAndActivateMic(activeLine, activeLineIndex)}
+              onClick={triggerActiveListening}
+              title="Skip remaining audio loops and speak now"
               style={{
                 display: 'inline-flex',
                 alignItems: 'center',
@@ -422,34 +399,57 @@ export function BlindListeningMode() {
               }}
             >
               <Mic size={12} />
-              <span>Pause & Speak Now</span>
+              <span>Speak Now</span>
             </button>
           </div>
 
           <div
             style={{
-              padding: '20px',
+              padding: '24px 20px',
               borderRadius: 10,
               background: '#030712',
               border: '1px solid #1f2937',
               textAlign: 'center',
               display: 'flex',
+              flexDirection: 'column',
               alignItems: 'center',
               justifyContent: 'center',
               gap: 8,
               color: '#d1d5db',
-              fontSize: 13,
-              fontWeight: 600,
             }}
           >
-            <EyeOff size={16} color="#fbbf24" />
-            <span>[ Subtitle 100% Blacked Out — Focus purely on German sound ]</span>
+            <EyeOff size={20} color="#fbbf24" />
+            <span style={{ fontSize: 13.5, fontWeight: 650, color: '#f3f4f6' }}>
+              [ Subtitle 100% Blacked Out — Focus purely on German sound ]
+            </span>
+            <span style={{ fontSize: 11.5, color: '#9ca3af' }}>
+              Playing {loopTarget}× uninterrupted. The video will automatically pause and open your microphone.
+            </span>
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+              Sentence {activeLineIndex + 1} of {transcript.length}
+            </span>
+            <button
+              onClick={handleSkip}
+              style={{
+                fontSize: 11.5,
+                color: 'var(--text-muted)',
+                background: 'none',
+                border: 'none',
+                cursor: 'pointer',
+                textDecoration: 'underline',
+              }}
+            >
+              Skip to next sentence →
+            </button>
           </div>
         </div>
       )}
 
-      {/* ── 3. PAUSED FOR SPEECH: VIDEO HARD PAUSED, MIC RECORDING (de-DE) ── */}
-      {blindState !== 'tracking' && blindState !== 'listening_loop' && (
+      {/* ── PAUSED FOR SPEECH & EVALUATION ── */}
+      {blindState !== 'listening_loop' && (
         <div
           className="animate-fade-in"
           style={{
@@ -462,6 +462,27 @@ export function BlindListeningMode() {
             border: '1.5px solid var(--border-subtle)',
           }}
         >
+          {/* Success Auto-Advance Banner */}
+          {blindState === 'correct' && (
+            <div
+              style={{
+                padding: '8px 14px',
+                borderRadius: 10,
+                background: 'rgba(16, 185, 129, 0.12)',
+                border: '1px solid rgba(16, 185, 129, 0.3)',
+                color: '#059669',
+                fontSize: 12.5,
+                fontWeight: 750,
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+              }}
+            >
+              <Sparkles size={14} />
+              <span>Ausgezeichnet ({diffResult?.score}%)! Automatischer Wechsel zum nächsten Satz…</span>
+            </div>
+          )}
+
           {/* Subtitle Card (Blacked out unless revealed or passed) */}
           <div
             style={{
@@ -477,14 +498,14 @@ export function BlindListeningMode() {
                 <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--success)', textTransform: 'uppercase', display: 'block', marginBottom: 4 }}>
                   German Subtitle Revealed:
                 </span>
-                <p style={{ fontSize: 16, fontWeight: 750, color: 'var(--text-primary)' }}>
+                <p style={{ fontSize: 17, fontWeight: 750, color: 'var(--text-primary)' }}>
                   {normalizedTarget}
                 </p>
               </div>
             ) : (
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, color: '#fbbf24', fontSize: 13, fontWeight: 650 }}>
                 <EyeOff size={15} />
-                <span>[ Subtitle Blacked Out — Speak what you heard in German ]</span>
+                <span>[ Subtitle Blacked Out — Speak what you heard into the microphone ]</span>
               </div>
             )}
           </div>
@@ -539,7 +560,7 @@ export function BlindListeningMode() {
               }}
             >
               <Volume2 size={12} />
-              Replay Sentence
+              Replay Audio
             </button>
 
             {blindState !== 'revealed' && blindState !== 'correct' && (
@@ -581,7 +602,7 @@ export function BlindListeningMode() {
                 marginLeft: 'auto',
               }}
             >
-              <span>Resume Video</span>
+              <span>Next Sentence</span>
               <SkipForward size={12} />
             </button>
           </div>

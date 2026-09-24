@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import {
-  Mic, SkipForward, RotateCcw, Volume2, Repeat, Headphones,
+  Mic, SkipForward, RotateCcw, Volume2, Headphones, Sparkles,
 } from 'lucide-react';
 import { useAppStore } from '@/store/appStore';
 import { useSpeechRecognition } from '@/hooks/useSpeechRecognition';
@@ -11,10 +11,10 @@ import { getGlobalPlayer } from '@/components/player/VideoPlayer';
 import { WordDiffFeedback } from './WordDiffFeedback';
 
 type ShadowState =
-  | 'tracking'        // tracking playback normally
-  | 'listening_loop'  // Listen-Only mode: playing sentence N times (NO mic, NO pause)
-  | 'active_exercise' // After N loops finished: video HARD PAUSED, microphone active
-  | 'correct'         // word match >= 80%: auto-resumes video
+  | 'tracking'        // watching/tracking
+  | 'listening_loop'  // playing sentence loop (NO mic, NO pause)
+  | 'active_exercise' // After N loops finished: video HARD PAUSED, microphone automatically active
+  | 'correct'         // word match >= 80%: auto-advances to next sentence
   | 'incorrect';      // word match < 80%: video remains PAUSED, prompts retry
 
 export function ShadowingMode() {
@@ -28,8 +28,6 @@ export function ShadowingMode() {
   const [lastSpoken, setLastSpoken] = useState('');
 
   const loopTarget = prepLoopTarget || 3;
-  const lastTimeMsRef = useRef<number>(0);
-  const pausedIdxSetRef = useRef<Set<number>>(new Set());
   const autoResumeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const seekingRef = useRef<boolean>(false);
   const isMountedRef = useRef(true);
@@ -49,7 +47,72 @@ export function ShadowingMode() {
     };
   }, []);
 
-  // ── Speech Recognition Evaluation (Granular Word Diffing, 80% Threshold) ──
+  const handleResultRef = useRef<(spoken: string) => void>(() => {});
+
+  const { start, abort, stopAndEvaluate, isListening, spokenText } = useSpeechRecognition({
+    lang: 'de-DE',
+    continuous: true,
+    silenceDebounceMs: 2200,
+    onResult: (spoken) => handleResultRef.current(spoken),
+  });
+
+  // ── 1. START LOOP CYCLE FOR A GIVEN SEGMENT ─────────────────────────────────
+  const startLoopForSegment = useCallback(
+    (index: number) => {
+      if (!isMountedRef.current || !transcript || !transcript[index]) return;
+      if (autoResumeTimerRef.current) clearTimeout(autoResumeTimerRef.current);
+
+      try {
+        abort();
+      } catch { /* ignore */ }
+
+      const line = transcript[index];
+      const { cleanText } = stripTrailingArticles(line.text);
+      const targetText = cleanText || line.text;
+
+      setActiveLine(targetText);
+      setActiveLineIndex(index);
+      setCurrentLoop(1);
+      setDiffResult(null);
+      setLastSpoken('');
+      setShadowState('listening_loop');
+
+      seekingRef.current = true;
+      setTimeout(() => {
+        seekingRef.current = false;
+      }, 400);
+
+      const player = getGlobalPlayer();
+      player?.seekTo(line.offset / 1000, true);
+      player?.playVideo();
+    },
+    [transcript, abort],
+  );
+
+  // ── 2. AUTOMATIC HARD PAUSE & MIC ACTIVATION ────────────────────────────────
+  const triggerActiveExercise = useCallback(() => {
+    if (autoResumeTimerRef.current) clearTimeout(autoResumeTimerRef.current);
+
+    // 1. Immediately HARD PAUSE YouTube video
+    try {
+      getGlobalPlayer()?.pauseVideo();
+    } catch (err) {
+      console.warn('Could not pause player:', err);
+    }
+
+    // 2. Automatically activate microphone without waiting for user click
+    setShadowState('active_exercise');
+    setDiffResult(null);
+    setLastSpoken('');
+
+    try {
+      start();
+    } catch (err) {
+      console.warn('Speech recognition start error:', err);
+    }
+  }, [start]);
+
+  // ── 3. SPEECH EVALUATION & AUTOMATIC ADVANCEMENT ────────────────────────────
   const handleResult = useCallback(
     (spoken: string) => {
       if (!isMountedRef.current || !normalizedTarget) return;
@@ -61,34 +124,35 @@ export function ShadowingMode() {
       setDiffResult(diff);
 
       if (diff.isPassing) {
-        // Correct (>= 80%): show green success feedback and resume video
+        // Correct (>= 80%): Show success, then AUTOMATICALLY advance to NEXT segment
         setShadowState('correct');
         if (autoResumeTimerRef.current) clearTimeout(autoResumeTimerRef.current);
+
         autoResumeTimerRef.current = setTimeout(() => {
           if (!isMountedRef.current) return;
-          getGlobalPlayer()?.playVideo();
-          setShadowState('tracking');
-          setLastSpoken('');
-          setDiffResult(null);
-          setCurrentLoop(1);
-        }, 1600);
+          const nextIndex = activeLineIndex + 1;
+          if (nextIndex < transcript.length) {
+            // FIX THE RESET BUG: Automatically advance to NEXT sentence, unpause, and begin loop cycle
+            startLoopForSegment(nextIndex);
+          } else {
+            getGlobalPlayer()?.playVideo();
+            setShadowState('tracking');
+          }
+        }, 1400);
       } else {
-        // Fails (< 80%): STRICT PROGRESSION - Video MUST REMAIN PAUSED!
+        // Fails (< 80%): Video MUST REMAIN PAUSED, prompts retry
         setShadowState('incorrect');
         try {
           getGlobalPlayer()?.pauseVideo();
         } catch { /* ignore */ }
       }
     },
-    [normalizedTarget],
+    [normalizedTarget, activeLineIndex, transcript.length, startLoopForSegment],
   );
 
-  const { start, abort, stopAndEvaluate, isListening, spokenText } = useSpeechRecognition({
-    lang: 'de-DE', // Strictly German locale
-    continuous: true, // Continuous listening so micro-pauses don't interrupt
-    silenceDebounceMs: 2500, // 2.5s silence buffer
-    onResult: handleResult,
-  });
+  useEffect(() => {
+    handleResultRef.current = handleResult;
+  }, [handleResult]);
 
   const speakReference = (text: string) => {
     if (typeof window === 'undefined' || !window.speechSynthesis) return;
@@ -99,113 +163,50 @@ export function ShadowingMode() {
     window.speechSynthesis.speak(u);
   };
 
-  // ── TRIGGER ACTIVE EXERCISE (Hard Pause Video & Open Mic) ──────────────────
-  const triggerActiveExercise = useCallback(() => {
-    if (autoResumeTimerRef.current) clearTimeout(autoResumeTimerRef.current);
-    setShadowState('active_exercise');
-    setDiffResult(null);
-    setLastSpoken('');
-
-    // 1. HARD PAUSE the YouTube video
-    try {
-      getGlobalPlayer()?.pauseVideo();
-    } catch (err) {
-      console.warn('Could not pause player:', err);
-    }
-
-    // 2. Start speech recognition with unlimited time
-    try {
-      start();
-    } catch (err) {
-      console.warn('Speech recognition start error:', err);
-    }
-  }, [start]);
-
-  // ── START SENTENCE PRACTICE (Listen-Only Phase) ────────────────────────────
-  const startSentencePractice = useCallback(
-    (lineText: string, index: number) => {
-      pausedIdxSetRef.current.add(index);
-      const { cleanText } = stripTrailingArticles(lineText);
-      const targetText = cleanText || lineText;
-      setActiveLine(targetText);
-      setActiveLineIndex(index);
-      setLastSpoken('');
-      setDiffResult(null);
-      setCurrentLoop(1);
-
-      if (loopTarget > 1) {
-        // Play sentence in Listen-Only mode (NO pausing, NO mic)
-        setShadowState('listening_loop');
-        seekingRef.current = true;
-        const line = transcript[index];
-        if (line) {
-          getGlobalPlayer()?.seekTo(line.offset / 1000, true);
-          getGlobalPlayer()?.playVideo();
-        }
-      } else {
-        // LoopTarget is 1: Pause video immediately for mic practice
-        triggerActiveExercise();
-      }
-    },
-    [loopTarget, transcript, triggerActiveExercise],
-  );
-
-  // ── PLAYBACK SYNCHRONIZATION & LOOP ENGINE ────────────────────────────────
+  // ── 4. AUTO-LOOP & AUTO-PAUSE DETECTION ENGINE ──────────────────────────────
   useEffect(() => {
     if (!transcript.length) return;
 
-    const timeMs = currentTimeSec * 1000;
-    const prevTimeMs = lastTimeMsRef.current;
-    lastTimeMsRef.current = timeMs;
-
-    // Reset passed index set on backward seek
-    if (timeMs < prevTimeMs - 2000) {
-      pausedIdxSetRef.current.clear();
-      seekingRef.current = false;
+    // Initial Auto-Start: pick segment based on current playhead or start from segment 0
+    if (activeLineIndex === -1) {
+      const timeMs = currentTimeSec * 1000;
+      const foundIdx = transcript.findIndex((l) => timeMs >= l.offset && timeMs < l.offset + l.duration);
+      const initialIdx = foundIdx !== -1 ? foundIdx : 0;
+      startLoopForSegment(initialIdx);
+      return;
     }
 
-    // 1. Tracking mode: detect sentence boundary
-    if (shadowState === 'tracking') {
-      for (let i = 0; i < transcript.length; i++) {
-        const line = transcript[i];
-        const lineEnd = line.offset + line.duration;
+    if (shadowState !== 'listening_loop' || activeLineIndex < 0) return;
 
-        const crossed = prevTimeMs <= lineEnd && timeMs >= lineEnd;
-        const withinWindow = timeMs >= lineEnd && timeMs <= lineEnd + 900;
+    const line = transcript[activeLineIndex];
+    if (!line) return;
 
-        if ((crossed || withinWindow) && !pausedIdxSetRef.current.has(i)) {
-          startSentencePractice(line.text, i);
-          break;
-        }
+    const lineStart = line.offset / 1000;
+    const lineEnd = (line.offset + line.duration) / 1000;
+
+    if (seekingRef.current) {
+      if (currentTimeSec >= lineStart - 0.2 && currentTimeSec < lineEnd - 0.2) {
+        seekingRef.current = false;
       }
+      return;
     }
 
-    // 2. Listening Loop mode: loop N times without pausing or mic
-    if (shadowState === 'listening_loop' && activeLineIndex >= 0) {
-      const line = transcript[activeLineIndex];
-      if (line) {
-        const lineStart = line.offset / 1000;
-        const lineEnd = (line.offset + line.duration) / 1000;
+    const timeMs = currentTimeSec * 1000;
+    const reachedEnd = currentTimeSec >= lineEnd - 0.15 || timeMs >= line.offset + line.duration - 120;
 
-        if (seekingRef.current) {
-          if (currentTimeSec >= lineStart && currentTimeSec < lineEnd - 0.25) {
-            seekingRef.current = false;
-          }
-          return;
-        }
-
-        // When playback reaches the end of the sentence
-        if (currentTimeSec >= lineEnd || (timeMs >= line.offset + line.duration - 100)) {
-          if (currentLoop < loopTarget) {
-            setCurrentLoop((prev) => prev + 1);
-            seekingRef.current = true;
-            getGlobalPlayer()?.seekTo(lineStart, true);
-            getGlobalPlayer()?.playVideo();
-          } else {
-            // All N listen-only loops finished: Hard pause and open mic
-            triggerActiveExercise();
-          }
-        }
+    if (reachedEnd) {
+      if (currentLoop < loopTarget) {
+        // Automatic loop repetition: increment loop and seek back to sentence start
+        setCurrentLoop((prev) => prev + 1);
+        seekingRef.current = true;
+        setTimeout(() => {
+          seekingRef.current = false;
+        }, 400);
+        getGlobalPlayer()?.seekTo(lineStart, true);
+        getGlobalPlayer()?.playVideo();
+      } else {
+        // Exact end of the loopTarget-th playback: AUTOMATIC HARD-PAUSE & AUTOMATIC MIC ACTIVATION!
+        triggerActiveExercise();
       }
     }
   }, [
@@ -215,39 +216,35 @@ export function ShadowingMode() {
     activeLineIndex,
     currentLoop,
     loopTarget,
-    startSentencePractice,
+    startLoopForSegment,
     triggerActiveExercise,
   ]);
-
-  const currentPlayingLine = useMemo(() => {
-    const timeMs = currentTimeSec * 1000;
-    return transcript.find((l) => timeMs >= l.offset && timeMs <= l.offset + l.duration) || null;
-  }, [transcript, currentTimeSec]);
 
   const handleSkip = () => {
     if (autoResumeTimerRef.current) clearTimeout(autoResumeTimerRef.current);
     abort();
-    getGlobalPlayer()?.playVideo();
-    setShadowState('tracking');
-    setLastSpoken('');
-    setDiffResult(null);
-    setCurrentLoop(1);
+    const nextIndex = activeLineIndex + 1;
+    if (nextIndex < transcript.length) {
+      startLoopForSegment(nextIndex);
+    } else {
+      getGlobalPlayer()?.playVideo();
+      setShadowState('tracking');
+    }
   };
 
   const handleRetry = () => {
     setLastSpoken('');
     setDiffResult(null);
     setShadowState('active_exercise');
+    try {
+      getGlobalPlayer()?.pauseVideo();
+    } catch { /* ignore */ }
     start();
   };
 
   const handleReplay = () => {
-    if (activeLineIndex >= 0 && transcript[activeLineIndex]) {
-      const line = transcript[activeLineIndex];
-      getGlobalPlayer()?.seekTo(line.offset / 1000, true);
-      getGlobalPlayer()?.playVideo();
-      setCurrentLoop(1);
-      setShadowState('listening_loop');
+    if (activeLineIndex >= 0) {
+      startLoopForSegment(activeLineIndex);
     }
   };
 
@@ -286,7 +283,7 @@ export function ShadowingMode() {
               Shadowing Practice
             </h3>
             <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-              Plays {loopTarget}× in Listen-Only mode · Hard-pauses video for mic on play {loopTarget + 1}
+              Auto-loops {loopTarget}× · Auto-pauses &amp; opens mic · Auto-advances on ≥ 80% match
             </span>
           </div>
         </div>
@@ -322,13 +319,17 @@ export function ShadowingMode() {
               padding: '3px 8px',
               borderRadius: 8,
               background:
-                shadowState === 'active_exercise' || shadowState === 'incorrect'
+                shadowState === 'correct'
+                  ? 'rgba(16, 185, 129, 0.12)'
+                  : shadowState === 'active_exercise' || shadowState === 'incorrect'
                   ? '#fef3c7'
                   : shadowState === 'listening_loop'
                   ? 'var(--accent-50)'
                   : 'var(--bg-elevated)',
               color:
-                shadowState === 'active_exercise' || shadowState === 'incorrect'
+                shadowState === 'correct'
+                  ? '#059669'
+                  : shadowState === 'active_exercise' || shadowState === 'incorrect'
                   ? '#b45309'
                   : shadowState === 'listening_loop'
                   ? 'var(--accent-700)'
@@ -344,80 +345,27 @@ export function ShadowingMode() {
                 height: 6,
                 borderRadius: '50%',
                 background:
-                  shadowState === 'active_exercise' || shadowState === 'incorrect'
+                  shadowState === 'correct'
+                    ? '#10b981'
+                    : shadowState === 'active_exercise' || shadowState === 'incorrect'
                     ? '#f59e0b'
                     : shadowState === 'listening_loop'
                     ? 'var(--accent-500)'
                     : 'var(--text-muted)',
               }}
             />
-            {shadowState === 'active_exercise' || shadowState === 'incorrect'
+            {shadowState === 'correct'
+              ? 'Passed! Auto-advancing…'
+              : shadowState === 'active_exercise' || shadowState === 'incorrect'
               ? 'Mic Active (Hard Paused)'
               : shadowState === 'listening_loop'
-              ? `Listen-Only Loop ${currentLoop}/${loopTarget}`
+              ? `Playing Loop ${currentLoop}/${loopTarget}`
               : 'Tracking Audio'}
           </span>
         </div>
       </div>
 
-      {/* ── 1. TRACKING PLAYBACK ── */}
-      {shadowState === 'tracking' && (
-        <div
-          style={{
-            display: 'flex',
-            flexDirection: 'column',
-            gap: 10,
-            padding: '14px 16px',
-            background: 'var(--bg-elevated)',
-            borderRadius: 14,
-            border: '1px solid var(--border-subtle)',
-          }}
-        >
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase' }}>
-              Current Sentence:
-            </span>
-            {currentPlayingLine && (
-              <button
-                onClick={() => startSentencePractice(currentPlayingLine.text, transcript.indexOf(currentPlayingLine))}
-                style={{
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: 5,
-                  padding: '4px 10px',
-                  borderRadius: 8,
-                  background: 'var(--accent-500)',
-                  color: '#ffffff',
-                  fontSize: 11.5,
-                  fontWeight: 600,
-                  border: 'none',
-                  cursor: 'pointer',
-                  boxShadow: 'var(--shadow-xs)',
-                }}
-              >
-                <Repeat size={12} />
-                Practice Sentence Now
-              </button>
-            )}
-          </div>
-
-          <p
-            style={{
-              fontSize: 15,
-              fontWeight: 650,
-              color: currentPlayingLine ? 'var(--text-primary)' : 'var(--text-muted)',
-              lineHeight: 1.4,
-              fontStyle: currentPlayingLine ? 'normal' : 'italic',
-            }}
-          >
-            {currentPlayingLine
-              ? removeConsecutiveDuplicates(currentPlayingLine.text)
-              : 'Playing video… will auto-loop at sentence boundary'}
-          </p>
-        </div>
-      )}
-
-      {/* ── 2. LISTEN-ONLY PHASE (Plays N times uninterrupted) ── */}
+      {/* ── LISTEN-ONLY LOOPING PHASE ── */}
       {shadowState === 'listening_loop' && (
         <div
           className="animate-fade-in"
@@ -435,11 +383,12 @@ export function ShadowingMode() {
             <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
               <Headphones size={15} color="var(--accent-600)" />
               <span style={{ fontSize: 12, fontWeight: 750, color: 'var(--accent-700)', textTransform: 'uppercase' }}>
-                Listen-Only Mode: Loop {currentLoop} of {loopTarget}
+                Listen-Only Cadence: Loop {currentLoop} of {loopTarget}
               </span>
             </div>
             <button
               onClick={triggerActiveExercise}
+              title="Skip remaining loops and speak immediately"
               style={{
                 display: 'inline-flex',
                 alignItems: 'center',
@@ -456,7 +405,7 @@ export function ShadowingMode() {
               }}
             >
               <Mic size={12} />
-              <span>Ready to Speak Now</span>
+              <span>Speak Now</span>
             </button>
           </div>
 
@@ -465,15 +414,18 @@ export function ShadowingMode() {
               {normalizedTarget}
             </p>
             <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
-              Listening to native cadence without interruption. The video will hard-pause and activate mic after loop {loopTarget}.
+              Listening to native pronunciation. After loop {loopTarget}, the video will automatically pause and open your microphone.
             </p>
           </div>
 
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+              Sentence {activeLineIndex + 1} of {transcript.length}
+            </span>
             <button
               onClick={handleSkip}
               style={{
-                fontSize: 11,
+                fontSize: 11.5,
                 color: 'var(--text-muted)',
                 background: 'none',
                 border: 'none',
@@ -481,14 +433,14 @@ export function ShadowingMode() {
                 textDecoration: 'underline',
               }}
             >
-              Skip this sentence
+              Skip to next sentence →
             </button>
           </div>
         </div>
       )}
 
-      {/* ── 3. ACTIVE EXERCISE (Hard Paused, Unlimited Time, Word-by-Word Diffing) ── */}
-      {shadowState !== 'tracking' && shadowState !== 'listening_loop' && (
+      {/* ── ACTIVE EXERCISE / EVALUATION / CORRECT / INCORRECT ── */}
+      {shadowState !== 'listening_loop' && (
         <div
           className="animate-fade-in"
           style={{
@@ -501,11 +453,32 @@ export function ShadowingMode() {
             border: '1.5px solid var(--border-subtle)',
           }}
         >
+          {/* Success Auto-Advance Banner */}
+          {shadowState === 'correct' && (
+            <div
+              style={{
+                padding: '8px 14px',
+                borderRadius: 10,
+                background: 'rgba(16, 185, 129, 0.12)',
+                border: '1px solid rgba(16, 185, 129, 0.3)',
+                color: '#059669',
+                fontSize: 12.5,
+                fontWeight: 750,
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+              }}
+            >
+              <Sparkles size={14} />
+              <span>Ausgezeichnet ({diffResult?.score}%)! Automatischer Wechsel zum nächsten Satz…</span>
+            </div>
+          )}
+
           {/* Target sentence display */}
           <div>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
               <span style={{ fontSize: 11, fontWeight: 800, color: 'var(--accent-700)', textTransform: 'uppercase' }}>
-                Target German Sentence (Hard Paused):
+                Target Sentence (Video Paused):
               </span>
               <button
                 onClick={() => speakReference(normalizedTarget)}
@@ -601,7 +574,7 @@ export function ShadowingMode() {
                 marginLeft: 'auto',
               }}
             >
-              <span>Skip Sentence</span>
+              <span>Next Sentence</span>
               <SkipForward size={12} />
             </button>
           </div>
