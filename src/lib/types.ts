@@ -31,7 +31,7 @@ export interface RepeatedSentence {
 }
 
 /** The 5 interactive learning modes */
-export type LearningMode = 'none' | 'shadowing' | 'voiceGapFill' | 'rolePlay' | 'blindListening';
+export type LearningMode = 'none' | 'shadowing' | 'voiceGapFill' | 'rolePlay' | 'blindListening' | 'grammar';
 
 /** Saved timestamp bookmark / flashcard */
 export interface BookmarkEntry {

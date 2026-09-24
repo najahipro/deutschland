@@ -1,6 +1,6 @@
 'use client';
 
-import { Play, Headphones, MessageSquareDashed, Users, Ear, Loader2, CheckCircle2 } from 'lucide-react';
+import { Play, Headphones, MessageSquareDashed, Users, Ear, BookOpen, Loader2, CheckCircle2 } from 'lucide-react';
 import { useAppStore } from '@/store/appStore';
 import type { LearningMode } from '@/lib/types';
 
@@ -39,6 +39,13 @@ const MODES: { id: LearningMode; label: string; Icon: React.ElementType; badge: 
     badge: 'Ear Training',
     Icon: Ear,
     description: 'Subtitles hidden — listen by ear and repeat what was said',
+  },
+  {
+    id: 'grammar',
+    label: 'Grammar',
+    badge: 'Conjugation',
+    Icon: BookOpen,
+    description: 'Auto-pauses on verbs — pick the correct conjugated form',
   },
 ];
 
@@ -83,7 +90,7 @@ export function ModeSelector() {
               textTransform: 'uppercase',
             }}
           >
-            5 Learning Modes
+            6 Learning Modes
           </span>
           <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>·</span>
           <span style={{ fontSize: 11, color: 'var(--text-secondary)', fontWeight: 500 }}>

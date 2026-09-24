@@ -24,6 +24,7 @@ import { ShadowingMode } from '@/components/player/LearningModes/ShadowingMode';
 import { VoiceGapFillMode } from '@/components/player/LearningModes/VoiceGapFillMode';
 import { RolePlayMode } from '@/components/player/LearningModes/RolePlayMode';
 import { BlindListeningMode } from '@/components/player/LearningModes/BlindListeningMode';
+import { GrammarMode } from '@/components/player/LearningModes/GrammarMode';
 import { HistoryPanel } from '@/components/history/HistoryPanel';
 import { Sidebar } from '@/components/layout/Sidebar';
 import { useAppStore } from '@/store/appStore';
@@ -350,6 +351,11 @@ export default function Home() {
                         <BlindListeningMode />
                       </div>
                     )}
+                    {activeMode === 'grammar' && (
+                      <div className="animate-fade-in">
+                        <GrammarMode />
+                      </div>
+                    )}
                   </>
                 )}
 
@@ -455,6 +461,8 @@ export default function Home() {
                   <RolePlayMode />
                 ) : activeMode === 'blindListening' ? (
                   <BlindListeningMode />
+                ) : activeMode === 'grammar' ? (
+                  <GrammarMode />
                 ) : (
                   <div
                     style={{
