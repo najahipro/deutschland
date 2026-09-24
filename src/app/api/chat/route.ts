@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
 export const runtime = 'nodejs';
 
@@ -12,7 +13,7 @@ Befolge strikt diese 5 Regeln:
 5. IMMER EINE RÜCKFRAGE: Beende deine Antwort JEDES MAL mit genau einer einfachen Frage auf Deutsch, um das Gespräch auf natürliche Weise fortzuführen (z. B. "Und was machst du heute?", "Trinkst du gerne Kaffee?", "Woher kommst du?").`;
 
 interface ChatRequestMessage {
-  role: 'system' | 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'model';
   content: string;
 }
 
@@ -28,66 +29,84 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const apiKey = process.env.OPENAI_API_KEY;
+    const apiKey = process.env.GEMINI_API_KEY;
 
-    if (!apiKey || apiKey === 'your_openai_api_key_here') {
+    if (!apiKey || apiKey === 'your_gemini_api_key_here') {
       return NextResponse.json(
         {
           error:
-            'OPENAI_API_KEY ist nicht in .env.local konfiguriert. Bitte füge deinen OpenAI API-Schlüssel hinzu.',
+            'GEMINI_API_KEY ist nicht in .env.local konfiguriert. Bitte trage deinen kostenlosen Gemini API-Schlüssel ein (https://aistudio.google.com/app/apikey).',
         },
         { status: 500 }
       );
     }
 
-    // Sanitize and trim messages to keep recent conversation history (last 12 messages)
-    const sanitizedMessages: ChatRequestMessage[] = messages
-      .filter((m) => m && typeof m.content === 'string' && m.content.trim().length > 0)
-      .slice(-12)
-      .map((m) => ({
-        role: m.role === 'assistant' ? 'assistant' : 'user',
-        content: m.content.trim(),
-      }));
-
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          ...sanitizedMessages,
-        ],
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({
+      model: 'gemini-1.5-flash',
+      systemInstruction: SYSTEM_PROMPT,
+      generationConfig: {
         temperature: 0.7,
-        max_tokens: 250,
-      }),
+        maxOutputTokens: 300,
+      },
     });
 
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
-      const errorMsg =
-        errorData?.error?.message ||
-        `OpenAI API Fehler (Status ${response.status}): ${response.statusText}`;
-      console.error('[api/chat] OpenAI request failed:', errorMsg);
-      return NextResponse.json({ error: errorMsg }, { status: response.status });
+    // Filter valid messages and keep recent history (last 12)
+    const validMessages = messages
+      .filter((m) => m && typeof m.content === 'string' && m.content.trim().length > 0)
+      .slice(-12);
+
+    if (validMessages.length === 0) {
+      return NextResponse.json(
+        { error: 'Keine gültigen Textnachrichten gefunden.' },
+        { status: 400 }
+      );
     }
 
-    const data = await response.json();
-    const reply = data.choices?.[0]?.message?.content?.trim();
+    // Convert to Gemini contents format:
+    // 1. Must start with 'user'
+    // 2. Roles must strictly alternate between 'user' and 'model'
+    const contents: { role: 'user' | 'model'; parts: { text: string }[] }[] = [];
+
+    // Find first user message index to skip initial bot welcome messages
+    const firstUserIndex = validMessages.findIndex((m) => m.role === 'user');
+    const relevantMessages = firstUserIndex !== -1 ? validMessages.slice(firstUserIndex) : validMessages;
+
+    for (const msg of relevantMessages) {
+      const targetRole: 'user' | 'model' = msg.role === 'user' ? 'user' : 'model';
+
+      if (contents.length > 0 && contents[contents.length - 1].role === targetRole) {
+        // Same role consecutive turn: combine text parts
+        contents[contents.length - 1].parts.push({ text: msg.content.trim() });
+      } else {
+        contents.push({
+          role: targetRole,
+          parts: [{ text: msg.content.trim() }],
+        });
+      }
+    }
+
+    // Ensure the conversation starts with 'user'
+    if (contents.length === 0 || contents[0].role !== 'user') {
+      contents.unshift({
+        role: 'user',
+        parts: [{ text: 'Hallo!' }],
+      });
+    }
+
+    const result = await model.generateContent({ contents });
+    const reply = result.response.text()?.trim();
 
     if (!reply) {
       return NextResponse.json(
-        { error: 'Keine Antwort von OpenAI erhalten.' },
+        { error: 'Keine Antwort von Gemini erhalten.' },
         { status: 502 }
       );
     }
 
     return NextResponse.json({ reply });
   } catch (err: unknown) {
-    console.error('[api/chat] Server error:', err);
+    console.error('[api/chat] Gemini API error:', err);
     const message = err instanceof Error ? err.message : 'Unerwarteter Serverfehler';
     return NextResponse.json({ error: message }, { status: 500 });
   }

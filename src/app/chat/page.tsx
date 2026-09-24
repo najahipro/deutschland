@@ -201,11 +201,11 @@ export default function ChatPage() {
                   }}
                 >
                   <Sparkles size={11} />
-                  A1 Live Partner
+                  100% Free · Gemini AI
                 </span>
               </div>
               <p style={{ fontSize: 11.5, color: 'var(--text-muted)', margin: '2px 0 0' }}>
-                Echte Konversation mit sanfter Grammatik-Korrektur &amp; Anschlussfragen
+                Kostenlose A1-Konversation mit sanfter Grammatik-Korrektur &amp; Anschlussfragen
               </p>
             </div>
           </div>
