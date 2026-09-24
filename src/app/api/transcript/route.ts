@@ -2,6 +2,13 @@ import { NextRequest, NextResponse } from 'next/server';
 import { YoutubeTranscript } from 'youtube-transcript';
 import ytdl from '@distube/ytdl-core';
 import type { TranscriptApiResponse, TranscriptLine, RepeatedSentence } from '@/lib/types';
+import {
+  shiftDanglingArticles,
+  cleanRepeatedSentences,
+  GERMAN_ARTICLES,
+  DANGLING_CONNECTORS,
+  stripTrailingArticles,
+} from '@/lib/transcript';
 
 export const runtime = 'nodejs';
 // Allow up to 120s for AI audio extraction & Whisper transcription
@@ -247,15 +254,24 @@ function combineChoppedLines(lines: TranscriptLine[]): TranscriptLine[] {
 
     bufferText = bufferText ? `${bufferText} ${raw}` : raw;
 
-    const endsWithTerminal = /[.!?]$/.test(bufferText.trim());
+    const trimmed = bufferText.trim();
+    const endsWithTerminal = /[.!?]$/.test(trimmed);
     const nextLine = lines[i + 1];
     const isBigGap = nextLine && (nextLine.offset - (lines[i].offset + lines[i].duration) > 1400);
-    const wordCount = bufferText.split(/\s+/).filter(Boolean).length;
+    const words = trimmed.split(/\s+/).filter(Boolean);
+    const wordCount = words.length;
 
-    if (endsWithTerminal || isBigGap || wordCount >= 10 || i === lines.length - 1) {
+    // Check if accumulated text ends with an article
+    const lastWord = words.length > 0 ? words[words.length - 1].toLowerCase().replace(/^[^\p{L}]+|[^\p{L}]+$/gu, '') : '';
+    const endsWithArticle = GERMAN_ARTICLES.has(lastWord);
+
+    // Never flush mid-noun-phrase on a dangling article unless end of stream
+    const canFlush = (!endsWithArticle || i === lines.length - 1);
+
+    if (canFlush && (endsWithTerminal || isBigGap || wordCount >= 10 || i === lines.length - 1)) {
       if (wordCount >= 2) {
         fullSentences.push({
-          text: bufferText.trim(),
+          text: trimmed,
           offset: bufferOffset,
           duration: Math.max(bufferDuration, 1000),
         });
@@ -266,7 +282,8 @@ function combineChoppedLines(lines: TranscriptLine[]): TranscriptLine[] {
     }
   }
 
-  return fullSentences;
+  // Strictly shift dangling articles to start of next chunk
+  return shiftDanglingArticles(fullSentences);
 }
 
 /**
@@ -275,7 +292,8 @@ function combineChoppedLines(lines: TranscriptLine[]): TranscriptLine[] {
  * 2. Maximum 14 words per phrase (prevents massive concatenated run-ons)
  * 3. Strips all bracket noise tags and removes duplicate word stutters
  * 4. Extracts recurrent full sentences AND communicative multi-word phrases (2-6 words)
- * 5. Guarantees top communicative daily life sentences from current video
+ * 5. Strictly rejects dangling articles ("die Zunge die", "Zunge die", "Zähne die", "Schnurbart der")
+ * 6. Guarantees top communicative daily life sentences from current video
  */
 export function analyseRepetitions(candidateLines: TranscriptLine[]): RepeatedSentence[] {
   const countMap = new Map<
@@ -286,10 +304,14 @@ export function analyseRepetitions(candidateLines: TranscriptLine[]): RepeatedSe
   // 1. First pass: count exact full sentence repetitions
   for (const line of candidateLines) {
     const text = cleanText(line.text || '');
-    const words = text.split(/\s+/).filter(Boolean);
+    const { cleanText: strippedText } = stripTrailingArticles(text);
+    const words = strippedText.split(/\s+/).filter(Boolean);
     if (words.length < 2 || words.length > 14) continue;
 
-    const key = normalizeKey(text);
+    const lastWord = words[words.length - 1].toLowerCase().replace(/^[^\p{L}]+|[^\p{L}]+$/gu, '');
+    if (GERMAN_ARTICLES.has(lastWord) || DANGLING_CONNECTORS.has(lastWord)) continue;
+
+    const key = normalizeKey(strippedText);
     const keyWords = key.split(' ').filter(Boolean);
     if (keyWords.length < 2) continue;
 
@@ -299,7 +321,7 @@ export function analyseRepetitions(candidateLines: TranscriptLine[]): RepeatedSe
     } else {
       countMap.set(key, {
         count: 1,
-        original: text,
+        original: strippedText,
         firstOffset: line.offset,
         wordCount: words.length,
       });
@@ -310,15 +332,37 @@ export function analyseRepetitions(candidateLines: TranscriptLine[]): RepeatedSe
   const phraseMap = new Map<string, { count: number; original: string; firstOffset: number; wordCount: number }>();
 
   for (const line of candidateLines) {
-    const words = cleanText(line.text || '').split(/\s+/).filter(Boolean);
-    if (words.length < 2) continue;
+    const rawTokens = cleanText(line.text || '').split(/\s+/).filter(Boolean);
+    if (rawTokens.length < 2) continue;
 
-    for (let len = 2; len <= Math.min(6, words.length); len++) {
-      for (let i = 0; i <= words.length - len; i++) {
-        const sliceWords = words.slice(i, i + len);
-        const rawSlice = sliceWords.join(' ');
+    for (let len = 2; len <= Math.min(6, rawTokens.length); len++) {
+      for (let i = 0; i <= rawTokens.length - len; i++) {
+        const sliceWords = rawTokens.slice(i, i + len);
+
+        const firstWord = sliceWords[0].toLowerCase().replace(/^[^\p{L}]+|[^\p{L}]+$/gu, '');
+        const lastWord = sliceWords[sliceWords.length - 1].toLowerCase().replace(/^[^\p{L}]+|[^\p{L}]+$/gu, '');
+
+        // Rule 1: A parsed phrase must NEVER end with a dangling article ("der", "die", "das", "den", "dem", "des", "ein", "eine")
+        if (GERMAN_ARTICLES.has(lastWord)) continue;
+
+        // Rule 2: A parsed phrase must NEVER end with a dangling connector ("und", "oder", "in", "von")
+        if (DANGLING_CONNECTORS.has(lastWord)) continue;
+
+        // Rule 3: A parsed phrase must NEVER start with a dangling connector
+        if (DANGLING_CONNECTORS.has(firstWord)) continue;
+
+        // Rule 4: Reject inverted noun-article n-grams like ["Zunge", "die"] or ["Schnurrbart", "der"]
+        if (sliceWords.length === 2 && !GERMAN_ARTICLES.has(firstWord) && GERMAN_ARTICLES.has(lastWord)) {
+          continue;
+        }
+
+        const rawSlice = sliceWords.join(' ').replace(/[,\-–—\s]+$/, '').trim();
         const key = normalizeKey(rawSlice);
-        if (key.split(' ').filter(Boolean).length < 2) continue;
+        const keyTokens = key.split(' ').filter(Boolean);
+        if (keyTokens.length < 2) continue;
+
+        const keyLast = keyTokens[keyTokens.length - 1];
+        if (GERMAN_ARTICLES.has(keyLast) || DANGLING_CONNECTORS.has(keyLast)) continue;
 
         const existing = phraseMap.get(key);
         if (existing) {
@@ -349,13 +393,17 @@ export function analyseRepetitions(candidateLines: TranscriptLine[]): RepeatedSe
     const COMMUNICATIVE_STARTERS = /^(wie|was|wo|warum|wann|wer|ich|du|wir|das|kannst|können|bitte|danke|vielen|auf|alles|guten|schön|es|hast|haben)/i;
     for (const line of candidateLines) {
       const text = cleanText(line.text || '');
-      const words = text.split(/\s+/).filter(Boolean);
-      if (words.length >= 2 && words.length <= 10 && COMMUNICATIVE_STARTERS.test(text)) {
-        const key = normalizeKey(text);
+      const { cleanText: strippedText } = stripTrailingArticles(text);
+      const words = strippedText.split(/\s+/).filter(Boolean);
+      if (words.length >= 2 && words.length <= 10 && COMMUNICATIVE_STARTERS.test(strippedText)) {
+        const lastWord = words[words.length - 1].toLowerCase().replace(/^[^\p{L}]+|[^\p{L}]+$/gu, '');
+        if (GERMAN_ARTICLES.has(lastWord) || DANGLING_CONNECTORS.has(lastWord)) continue;
+
+        const key = normalizeKey(strippedText);
         if (!countMap.has(key)) {
           countMap.set(key, {
             count: 1,
-            original: text,
+            original: strippedText,
             firstOffset: line.offset,
             wordCount: words.length,
           });
@@ -365,7 +413,7 @@ export function analyseRepetitions(candidateLines: TranscriptLine[]): RepeatedSe
     }
   }
 
-  return Array.from(countMap.values())
+  const rawResults: RepeatedSentence[] = Array.from(countMap.values())
     .sort((a, b) => {
       if (b.count !== a.count) return b.count - a.count;
       return b.wordCount - a.wordCount;
@@ -376,4 +424,6 @@ export function analyseRepetitions(candidateLines: TranscriptLine[]): RepeatedSe
       count: v.count,
       firstOffset: v.firstOffset,
     }));
+
+  return cleanRepeatedSentences(rawResults);
 }

@@ -1,4 +1,9 @@
-// ─── Global Common Phrases Store & Utilities ─────────────────────────────────
+import {
+  shiftDanglingArticles,
+  stripTrailingArticles,
+  GERMAN_ARTICLES,
+  DANGLING_CONNECTORS,
+} from './transcript';
 
 export interface GlobalPhraseEntry {
   phraseKey: string;           // Normalized lowercase key for matching
@@ -145,7 +150,40 @@ export function getStoredGlobalPhrases(): Record<string, GlobalPhraseEntry> {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(seedMap));
       return seedMap;
     }
-    return JSON.parse(raw);
+
+    const parsed: Record<string, GlobalPhraseEntry> = JSON.parse(raw);
+    const cleanedStore: Record<string, GlobalPhraseEntry> = {};
+    let hasCorrupted = false;
+
+    // Purge any previously stored corrupted phrases ending in dangling articles
+    // e.g. "die zunge die", "zunge die", "zähne die", "schnurbart der"
+    for (const [key, entry] of Object.entries(parsed)) {
+      const words = key.split(' ').filter(Boolean);
+      if (words.length < 2) {
+        hasCorrupted = true;
+        continue;
+      }
+      const firstWord = words[0];
+      const lastWord = words[words.length - 1];
+
+      if (GERMAN_ARTICLES.has(lastWord) || DANGLING_CONNECTORS.has(lastWord) || DANGLING_CONNECTORS.has(firstWord)) {
+        hasCorrupted = true;
+        continue;
+      }
+      if (words.length === 2 && !GERMAN_ARTICLES.has(firstWord) && GERMAN_ARTICLES.has(lastWord)) {
+        hasCorrupted = true;
+        continue;
+      }
+      cleanedStore[key] = entry;
+    }
+
+    if (hasCorrupted) {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(cleanedStore));
+      } catch { /* ignore */ }
+    }
+
+    return cleanedStore;
   } catch (err) {
     console.error('[globalPhrases] Failed to read from localStorage:', err);
     return {};
@@ -166,7 +204,11 @@ export function saveGlobalPhrases(phrases: Record<string, GlobalPhraseEntry>) {
 }
 
 /**
- * Updates the global dictionary with sentences from a newly fetched video transcript
+ * Updates the global dictionary with sentences from a newly fetched video transcript,
+ * strictly enforcing German grammatical boundaries:
+ * 1. Never end with an article ("der", "die", "das", "den", "dem", "des", "ein", "eine").
+ * 2. Shift dangling articles to the start of the next chunk.
+ * 3. Keep noun phrases together (e.g. "die Zunge", "der Schnurrbart").
  */
 export function recordTranscriptPhrases(
   videoId: string,
@@ -179,10 +221,13 @@ export function recordTranscriptPhrases(
     const store = getStoredGlobalPhrases();
     const now = new Date().toISOString();
 
-    // 1. Deduplicate phrases within the current video's transcript
+    // 1. First ensure chronological lines have dangling articles shifted
+    const normalizedLines = shiftDanglingArticles(lines as { text: string; offset: number; duration: number }[]);
+
+    // 2. Deduplicate phrases within the current video's transcript
     const videoPhraseMap = new Map<string, string>(); // phraseKey -> cleanOriginalText
 
-    for (const line of lines) {
+    for (const line of normalizedLines) {
       if (!line?.text) continue;
       // Split into sentence-like clauses
       const rawSentences = line.text
@@ -194,24 +239,38 @@ export function recordTranscriptPhrases(
       for (const raw of rawSentences) {
         // Skip tags like [Musik]
         if (/^\[.*\]$/.test(raw)) continue;
-        const key = normalizePhraseKey(raw);
-        // We want real phrases of at least 2 words and not excessively long (< 120 chars)
+
+        // Strip any dangling articles or connectors from the phrase
+        const { cleanText: strippedRaw } = stripTrailingArticles(raw);
+        if (!strippedRaw) continue;
+
+        const key = normalizePhraseKey(strippedRaw);
         const words = key.split(' ').filter(Boolean);
         if (words.length < 2 || words.length > 15 || key.length < 5 || key.length > 120) {
           continue;
         }
 
+        const firstWord = words[0];
+        const lastWord = words[words.length - 1];
+
+        // Strict Rule: NEVER end with an article or connector
+        if (GERMAN_ARTICLES.has(lastWord) || DANGLING_CONNECTORS.has(lastWord)) continue;
+        // Never start with a dangling connector
+        if (DANGLING_CONNECTORS.has(firstWord)) continue;
+        // Reject inverted noun-article phrases like "Zunge die"
+        if (words.length === 2 && !GERMAN_ARTICLES.has(firstWord) && GERMAN_ARTICLES.has(lastWord)) continue;
+
         if (!videoPhraseMap.has(key)) {
-          const cleanOriginal = raw
+          const cleanOriginal = strippedRaw
             .replace(/\[.*?\]|\(.*?\)|♪/g, '')
             .replace(/^\s*[,\-–—\s]+/, '')
             .trim();
-          videoPhraseMap.set(key, cleanOriginal || raw);
+          videoPhraseMap.set(key, cleanOriginal || strippedRaw);
         }
       }
     }
 
-    // 2. Update global store: strictly prevent duplicate counting on video replay/loop
+    // 3. Update global store: strictly prevent duplicate counting on video replay/loop
     for (const [key, cleanOriginal] of videoPhraseMap.entries()) {
       if (!store[key]) {
         // New phrase seen for the first time

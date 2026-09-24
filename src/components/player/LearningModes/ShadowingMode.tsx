@@ -6,7 +6,7 @@ import {
 } from 'lucide-react';
 import { useAppStore } from '@/store/appStore';
 import { useSpeechRecognition } from '@/hooks/useSpeechRecognition';
-import { removeConsecutiveDuplicates, diffSentenceWords, type WordDiffResult } from '@/lib/transcript';
+import { removeConsecutiveDuplicates, diffSentenceWords, type WordDiffResult, stripTrailingArticles } from '@/lib/transcript';
 import { getGlobalPlayer } from '@/components/player/VideoPlayer';
 import { WordDiffFeedback } from './WordDiffFeedback';
 
@@ -34,8 +34,12 @@ export function ShadowingMode() {
   const seekingRef = useRef<boolean>(false);
   const isMountedRef = useRef(true);
 
-  // Target sentence with consecutive duplicate stutter words removed
-  const normalizedTarget = useMemo(() => removeConsecutiveDuplicates(activeLine), [activeLine]);
+  // Target sentence with consecutive duplicate stutter words and trailing dangling articles removed
+  const normalizedTarget = useMemo(() => {
+    const deduped = removeConsecutiveDuplicates(activeLine);
+    const { cleanText } = stripTrailingArticles(deduped);
+    return cleanText || deduped;
+  }, [activeLine]);
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -121,7 +125,9 @@ export function ShadowingMode() {
   const startSentencePractice = useCallback(
     (lineText: string, index: number) => {
       pausedIdxSetRef.current.add(index);
-      setActiveLine(lineText);
+      const { cleanText } = stripTrailingArticles(lineText);
+      const targetText = cleanText || lineText;
+      setActiveLine(targetText);
       setActiveLineIndex(index);
       setLastSpoken('');
       setDiffResult(null);

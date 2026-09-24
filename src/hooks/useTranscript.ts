@@ -3,6 +3,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { useAppStore } from '@/store/appStore';
 import { recordTranscriptPhrases } from '@/lib/globalPhrases';
+import { shiftDanglingArticles, cleanRepeatedSentences } from '@/lib/transcript';
 import type { VideoItem } from '@/lib/types';
 
 export function useTranscript() {
@@ -36,9 +37,18 @@ export function useTranscript() {
         if (data.error) {
           setTranscriptError(data.error);
         } else {
-          const lines = data.lines ?? [];
+          const rawLines = data.lines ?? [];
+          const rawRepeated = data.repeatedSentences ?? [];
+
+          // Enforce German structural rules:
+          // 1. Never end with an article
+          // 2. Shift dangling articles to start of next chunk
+          // 3. Keep noun phrases together
+          const lines = shiftDanglingArticles(rawLines);
+          const repeated = cleanRepeatedSentences(rawRepeated);
+
           setTranscript(lines);
-          setRepeatedSentences(data.repeatedSentences ?? []);
+          setRepeatedSentences(repeated);
           // Record phrases in Global Common Phrases dictionary across videos
           recordTranscriptPhrases(video.id, video.title, lines);
         }
