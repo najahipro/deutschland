@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { Search, Clock, BookOpen, Loader2, X, Sparkles } from 'lucide-react';
+import { Search, Clock, BookOpen, Loader2, X, Sparkles, MessageSquare, Layers } from 'lucide-react';
 import { useCallback, useRef, useState, useEffect } from 'react';
 import { useAppStore } from '@/store/appStore';
 import { useVideoHistory } from '@/hooks/useVideoHistory';
@@ -145,6 +145,44 @@ export function Header() {
         >
           <Sparkles size={12} color="var(--accent-600)" />
           Common Phrases
+        </Link>
+        <Link
+          href="/chat"
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 5,
+            padding: '5px 10px',
+            borderRadius: 8,
+            fontSize: 12,
+            fontWeight: 600,
+            color: 'var(--text-secondary)',
+            textDecoration: 'none',
+            transition: 'all 0.15s ease',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          <MessageSquare size={12} />
+          AI Chat
+        </Link>
+        <Link
+          href="/word-swipe"
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 5,
+            padding: '5px 10px',
+            borderRadius: 8,
+            fontSize: 12,
+            fontWeight: 600,
+            color: 'var(--text-secondary)',
+            textDecoration: 'none',
+            transition: 'all 0.15s ease',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          <Layers size={12} />
+          Word Swipe
         </Link>
       </nav>
 

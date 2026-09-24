@@ -86,12 +86,12 @@ export interface WordDiffResult {
   totalTargetWords: number;
 }
 
-/** Clean a single word for matching, keeping German umlauts and letters */
+/** Clean a single word for matching, converting to lowercase and stripping all punctuation while preserving German umlauts and letters */
 export function cleanWord(w: string): string {
   if (!w) return '';
   return w
     .toLowerCase()
-    .replace(/[.,!?;:"""''„"«»()[\]{}]/g, '')
+    .replace(/[^\p{L}\p{N}]/gu, '')
     .trim();
 }
 
@@ -101,21 +101,25 @@ export function wordsMatch(spoken: string, target: string): boolean {
   const t = cleanWord(target);
   if (!s || !t) return false;
   if (s === t) return true;
-  // Allow small edit distance tolerance for minor recognition quirks (e.g., ß vs ss)
+  // Handle German ß vs ss (e.g. groß vs gross)
+  if (s.replace(/ß/g, 'ss') === t.replace(/ß/g, 'ss')) return true;
+  // Allow small edit distance tolerance for minor recognition quirks
   const maxDist = t.length <= 4 ? 1 : 2;
   return levenshtein(s, t) <= maxDist;
 }
 
 /**
  * Word-by-word diffing between user's spoken transcript and target sentence.
- * Returns granular status for each word (green vs. red bold) and fair 80% passing evaluation.
+ * - Strict normalization: lowercase, strip all punctuation, preserve umlauts (ä, ö, ü, ß).
+ * - Robust LCS sequence alignment at the word level.
+ * - Accurate scoring: (Correctly Matched Words / Total Target Words) * 100.
  */
 export function diffSentenceWords(spokenText: string, targetText: string): WordDiffResult {
   const cleanSpokenText = removeConsecutiveDuplicates(spokenText);
   const cleanTargetText = removeConsecutiveDuplicates(targetText);
 
-  const spokenTokens = cleanSpokenText.split(/\s+/).filter(Boolean);
-  const targetTokens = cleanTargetText.split(/\s+/).filter(Boolean);
+  const spokenTokens = cleanSpokenText.trim().split(/\s+/).filter(Boolean);
+  const targetTokens = cleanTargetText.trim().split(/\s+/).filter(Boolean);
 
   if (targetTokens.length === 0) {
     return {
@@ -142,16 +146,15 @@ export function diffSentenceWords(spokenText: string, targetText: string): WordD
   const n = targetTokens.length;
   const m = spokenTokens.length;
 
-  // DP table for Longest Common Subsequence of words
+  // DP table for Longest Common Subsequence of words with monotonicity preserved
   const dp: number[][] = Array.from({ length: n + 1 }, () => Array(m + 1).fill(0));
 
   for (let i = 1; i <= n; i++) {
     for (let j = 1; j <= m; j++) {
       if (wordsMatch(spokenTokens[j - 1], targetTokens[i - 1])) {
         dp[i][j] = dp[i - 1][j - 1] + 1;
-      } else {
-        dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
       }
+      dp[i][j] = Math.max(dp[i][j], dp[i - 1][j], dp[i][j - 1]);
     }
   }
 
@@ -182,10 +185,8 @@ export function diffSentenceWords(spokenText: string, targetText: string): WordD
   const missingWords: string[] = targetTokens.filter((_, idx) => !targetMatches.has(idx));
   const matchedWordsCount = targetMatches.size;
 
-  // Fair 80% word match calculation:
-  const maxWords = Math.max(targetTokens.length, spokenTokens.length);
-  const ratio = maxWords > 0 ? matchedWordsCount / maxWords : 0;
-  const score = Math.round(ratio * 100);
+  // Accurate scoring: (Correctly Matched Words / Total Target Words) * 100
+  const score = targetTokens.length > 0 ? Math.round((matchedWordsCount / targetTokens.length) * 100) : 100;
   const isPassing = score >= 80;
 
   return {
@@ -196,6 +197,75 @@ export function diffSentenceWords(spokenText: string, targetText: string): WordD
     matchedWordsCount,
     totalTargetWords: targetTokens.length,
   };
+}
+
+// ─── Grouped Dialogue Turns for Role-Play (Speaker Diarization) ──────────────
+
+export interface DialogueTurn {
+  id: number;
+  text: string;
+  offset: number;     // ms start of turn
+  duration: number;   // ms total duration
+  speaker: 0 | 1;     // 0 = Speaker A, 1 = Speaker B
+  chunkIndices: number[];
+}
+
+/**
+ * Group raw YouTube caption chunks into complete, logical sentences/turns.
+ * Uses terminal punctuation (. ? ! …) and timing gaps > 1 second (1000ms)
+ * to prevent mid-sentence cutoffs.
+ */
+export function groupTranscriptIntoTurns(lines: TranscriptLine[]): DialogueTurn[] {
+  if (!lines || lines.length === 0) return [];
+
+  const turns: DialogueTurn[] = [];
+  let currentChunks: TranscriptLine[] = [];
+  let currentIndices: number[] = [];
+  let speakerTurn: 0 | 1 = 0;
+
+  const flushTurn = () => {
+    if (currentChunks.length === 0) return;
+    const first = currentChunks[0];
+    const last = currentChunks[currentChunks.length - 1];
+    const fullText = currentChunks.map((c) => c.text.trim()).join(' ').replace(/\s+/g, ' ').trim();
+    const duration = (last.offset + last.duration) - first.offset;
+
+    turns.push({
+      id: turns.length,
+      text: fullText,
+      offset: first.offset,
+      duration: Math.max(duration, 500),
+      speaker: speakerTurn,
+      chunkIndices: [...currentIndices],
+    });
+
+    speakerTurn = speakerTurn === 0 ? 1 : 0;
+    currentChunks = [];
+    currentIndices = [];
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.text.trim()) continue;
+
+    if (currentChunks.length > 0) {
+      const prev = currentChunks[currentChunks.length - 1];
+      const gap = line.offset - (prev.offset + prev.duration);
+      const prevText = prev.text.trim();
+      const hasTerminalPunctuation = /[.?!…][”"']?$/.test(prevText);
+
+      // Terminal punctuation OR timing gap > 1 second indicates end of turn
+      if (hasTerminalPunctuation || gap > 1000) {
+        flushTurn();
+      }
+    }
+
+    currentChunks.push(line);
+    currentIndices.push(i);
+  }
+
+  flushTurn();
+  return turns;
 }
 
 // ─── Gap-Fill Helpers ─────────────────────────────────────────────────────────

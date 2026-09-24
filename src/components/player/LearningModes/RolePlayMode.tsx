@@ -1,40 +1,49 @@
 'use client';
 
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { Users, Volume2, VolumeX, Mic, RotateCcw, SkipForward, Play } from 'lucide-react';
+import { Users, Volume2, VolumeX, Mic, RotateCcw, SkipForward, Play, Eye } from 'lucide-react';
 import { useAppStore } from '@/store/appStore';
 import { useSpeechRecognition } from '@/hooks/useSpeechRecognition';
 import { getGlobalPlayer } from '@/components/player/VideoPlayer';
-import { removeConsecutiveDuplicates, diffSentenceWords, type WordDiffResult } from '@/lib/transcript';
+import {
+  removeConsecutiveDuplicates,
+  diffSentenceWords,
+  groupTranscriptIntoTurns,
+  type DialogueTurn,
+  type WordDiffResult,
+} from '@/lib/transcript';
 import { WordDiffFeedback } from './WordDiffFeedback';
 
 /**
- * 6-Step State Machine for Role-Play Dialogue:
- * 1. PARTNER'S TURN: Video plays normally, audio UNMUTED (player.unMute()).
- * 2. USER'S TURN STARTS: Exact millisecond line begins, video instantly mute() AND pauseVideo().
- * 3. SPEAKING PHASE: Video remains paused & muted. Web Speech API waits for user to speak.
- * 4. VALIDATION: Fail (< 80%) = stays paused. Success (>= 80%) = calls playVideo().
- * 5. SILENT PLAYBACK: Video plays user's turn while REMAINING MUTED.
- * 6. NEXT TURN: The instant partner's line starts, video calls unMute().
+ * Natural Dialogue Role-Play State Machine:
+ * 1. Partner's turn: Play video normally (Audio ON / unMute).
+ * 2. User's turn starts: MUTE the video (player.mute()), but KEEP PLAYING so user watches character act.
+ * 3. User's turn ends (end timestamp): Instantly PAUSE the video (player.pauseVideo()).
+ * 4. Waiting / Speaking: Wait for user to speak into the microphone (unlimited time).
+ * 5. Validation: If < 80%, stay paused/muted for retry. If >= 80%, UNMUTE (player.unMute()) & RESUME (player.playVideo()).
  */
-type RolePlayStep =
-  | 'partner_turn'       // Step 1: Partner speaks, unmuted video playing
-  | 'user_speaking'      // Step 2 & 3: User's turn starts, video instantly MUTED & PAUSED, mic active
-  | 'user_retry'         // Step 4 (Failed): Video stays paused & muted, prompts retry
-  | 'user_silent_play';  // Step 5: Passed (>=80%), plays user turn while REMAINING MUTED
+type RolePlayState =
+  | 'partner_turn'   // Step 1: Partner speaks with video unmuted and playing
+  | 'user_acting'    // Step 2: User's turn starts: video MUTED, but plays silently so user watches actor
+  | 'user_speaking'  // Step 3 & 4: Turn ends: video PAUSED & MUTED, mic active
+  | 'user_retry'     // Step 4 (Failed): Video stays paused & muted, prompt retry
+  | 'user_passed';   // Step 5: Passed (>= 80%), auto-unmutes and resumes playback
 
 export function RolePlayMode() {
   const { transcript, currentTimeSec } = useAppStore();
 
-  // User selects role: 0 = Speaker A, 1 = Speaker B
-  const [userRole, setUserRole] = useState<0 | 1>(0);
-  const [roleState, setRoleState] = useState<RolePlayStep>('partner_turn');
-  const [activeUserLineIdx, setActiveUserLineIdx] = useState<number>(-1);
+  // User selects role: 0 = Speaker A, 1 = Speaker B (default Speaker B)
+  const [userRole, setUserRole] = useState<0 | 1>(1);
+  const [roleState, setRoleState] = useState<RolePlayState>('partner_turn');
+  const [activeTurnIdx, setActiveTurnIdx] = useState<number>(-1);
   const [diffResult, setDiffResult] = useState<WordDiffResult | null>(null);
   const [lastSpoken, setLastSpoken] = useState('');
 
-  const completedLinesRef = useRef<Set<number>>(new Set());
-  const autoResumeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Group raw chunks into complete logical sentences / dialogue turns
+  const turns = useMemo(() => groupTranscriptIntoTurns(transcript), [transcript]);
+
+  const completedTurnsRef = useRef<Set<number>>(new Set());
+  const resumeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastTimeMsRef = useRef<number>(0);
   const isMountedRef = useRef(true);
 
@@ -42,32 +51,36 @@ export function RolePlayMode() {
     isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
-      if (autoResumeTimerRef.current) clearTimeout(autoResumeTimerRef.current);
+      if (resumeTimerRef.current) clearTimeout(resumeTimerRef.current);
+      try {
+        const player = getGlobalPlayer();
+        player?.unMute();
+      } catch { /* ignore */ }
     };
   }, []);
 
-  // Find active line based on current playback time
-  const currentLineInfo = useMemo(() => {
+  // Find active turn based on playback time
+  const currentTurnInfo = useMemo(() => {
     const timeMs = currentTimeSec * 1000;
-    const index = transcript.findIndex((l) => timeMs >= l.offset && timeMs <= l.offset + l.duration);
+    const index = turns.findIndex((t) => timeMs >= t.offset && timeMs < t.offset + t.duration);
     if (index === -1) return null;
-    const speaker = (index % 2) as 0 | 1;
+    const turn = turns[index];
     return {
-      line: transcript[index],
+      turn,
       index,
-      speaker,
-      isUserTurn: speaker === userRole,
+      speaker: turn.speaker,
+      isUserTurn: turn.speaker === userRole,
     };
-  }, [transcript, currentTimeSec, userRole]);
+  }, [turns, currentTimeSec, userRole]);
 
-  // Target sentence for active line
-  const activeLine = activeUserLineIdx >= 0 && transcript[activeUserLineIdx]
-    ? transcript[activeUserLineIdx]
-    : currentLineInfo?.line || null;
+  // Target sentence for active turn
+  const activeTurn = activeTurnIdx >= 0 && turns[activeTurnIdx]
+    ? turns[activeTurnIdx]
+    : currentTurnInfo?.turn || null;
 
-  const targetClean = activeLine ? removeConsecutiveDuplicates(activeLine.text) : '';
+  const targetClean = activeTurn ? removeConsecutiveDuplicates(activeTurn.text) : '';
 
-  // ── Step 4: Validation (>= 80% Word Match) ─────────────────────────────────
+  // ── Step 5: Speech Validation (>= 80% Word Match) ─────────────────────────
   const handleResult = useCallback(
     (spoken: string) => {
       if (!isMountedRef.current || !targetClean) return;
@@ -80,23 +93,28 @@ export function RolePlayMode() {
       setDiffResult(diff);
 
       if (diff.isPassing) {
-        // Step 4 (Success >= 80%): Mark line as completed
-        if (activeUserLineIdx >= 0) {
-          completedLinesRef.current.add(activeUserLineIdx);
+        // Step 5: Mark turn completed
+        if (activeTurnIdx >= 0) {
+          completedTurnsRef.current.add(activeTurnIdx);
         }
 
-        // Transition to Step 5: Resume playback while REMAINING STRICTLY MUTED
-        if (autoResumeTimerRef.current) clearTimeout(autoResumeTimerRef.current);
-        autoResumeTimerRef.current = setTimeout(() => {
+        setRoleState('user_passed');
+
+        if (resumeTimerRef.current) clearTimeout(resumeTimerRef.current);
+        resumeTimerRef.current = setTimeout(() => {
           if (!isMountedRef.current) return;
-          setRoleState('user_silent_play');
           try {
-            player?.mute(); // Step 5: MUST REMAIN MUTED
-            player?.playVideo(); // Call playVideo()
+            // UNMUTE and RESUME playback for partner's next turn
+            player?.unMute();
+            player?.playVideo();
           } catch (e) {
-            console.warn('[RolePlayMode] playVideo failed:', e);
+            console.warn('[RolePlayMode] playVideo/unMute failed:', e);
           }
-        }, 1200);
+          setRoleState('partner_turn');
+          setActiveTurnIdx(-1);
+          setDiffResult(null);
+          setLastSpoken('');
+        }, 1100);
       } else {
         // Step 4 (Failed < 80%): Video MUST REMAIN PAUSED AND MUTED
         setRoleState('user_retry');
@@ -106,97 +124,58 @@ export function RolePlayMode() {
         } catch { /* ignore */ }
       }
     },
-    [targetClean, activeUserLineIdx],
+    [targetClean, activeTurnIdx],
   );
 
   const { start, abort, stopAndEvaluate, isListening, spokenText } = useSpeechRecognition({
-    lang: 'de-DE', // Strictly German locale
-    continuous: true, // Continuous listening
-    silenceDebounceMs: 2500, // 2.5s silence buffer
+    lang: 'de-DE',
+    continuous: true,
+    silenceDebounceMs: 2200,
     onResult: handleResult,
   });
 
-  // ── Step 2 & 3: Trigger User Turn (MUTE + PAUSE + Open Mic) ────────────────
-  const triggerUserTurn = useCallback(
-    (lineIdx: number) => {
-      if (completedLinesRef.current.has(lineIdx)) return;
-
-      const player = getGlobalPlayer();
-      const line = transcript[lineIdx];
-
-      // Step 2: EXACT millisecond line begins -> instantly mute() AND pauseVideo()
-      try {
-        player?.mute();
-        player?.pauseVideo();
-        if (line) {
-          player?.seekTo(line.offset / 1000, true);
-        }
-      } catch (err) {
-        console.warn('[RolePlayMode] Error pausing and muting player:', err);
-      }
-
-      setActiveUserLineIdx(lineIdx);
-      setRoleState('user_speaking');
-      setDiffResult(null);
-      setLastSpoken('');
-
-      // Step 3: Speaking phase -> Web Speech API waits for user to speak
-      try {
-        start();
-      } catch (err) {
-        console.warn('[RolePlayMode] Error starting speech recognition:', err);
-      }
-    },
-    [transcript, start],
-  );
-
-  // ── Time-Tracking & 6-Step State Machine Transitions ──────────────────────
+  // ── Time-Tracking & Timeline State Machine Transitions ────────────────────
   useEffect(() => {
-    if (!transcript.length) return;
+    if (!turns.length) return;
     const player = getGlobalPlayer();
     const timeMs = currentTimeSec * 1000;
     const prevTimeMs = lastTimeMsRef.current;
     lastTimeMsRef.current = timeMs;
 
-    // Backward seek: reset completed lines ahead of seek position
+    // Reset completed turns ahead if user seeks backward
     if (timeMs < prevTimeMs - 1500) {
-      completedLinesRef.current.forEach((idx) => {
-        if (transcript[idx] && transcript[idx].offset >= timeMs - 500) {
-          completedLinesRef.current.delete(idx);
+      completedTurnsRef.current.forEach((idx) => {
+        if (turns[idx] && turns[idx].offset >= timeMs - 500) {
+          completedTurnsRef.current.delete(idx);
         }
       });
     }
 
-    // ── STEP 5 HANDLING: Silent Playback (Audio remains MUTED) ───────────────
-    if (roleState === 'user_silent_play') {
-      const activeLineObj = activeUserLineIdx >= 0 ? transcript[activeUserLineIdx] : null;
-      const nextLineObj = activeUserLineIdx >= 0 && activeUserLineIdx + 1 < transcript.length
-        ? transcript[activeUserLineIdx + 1]
-        : null;
+    // ── STEP 3: User Acting Ended -> PAUSE & ACTIVATE MIC ─────────────────────
+    if (roleState === 'user_acting') {
+      const activeObj = activeTurnIdx >= 0 ? turns[activeTurnIdx] : null;
+      const turnEnd = activeObj ? activeObj.offset + activeObj.duration : 0;
 
-      const userLineEnd = activeLineObj ? activeLineObj.offset + activeLineObj.duration : 0;
-      const nextLineStart = nextLineObj ? nextLineObj.offset : userLineEnd;
-
-      // ── STEP 6 TRANSITION: As soon as partner's next line starts -> unMute() ──
-      if (timeMs >= nextLineStart - 80 || timeMs >= userLineEnd - 80) {
+      // When the character acting finishes on screen: PAUSE & START MIC
+      if (timeMs >= turnEnd - 100 || (activeObj && timeMs < activeObj.offset)) {
         try {
-          player?.unMute(); // Step 6: Instantly unMute()
+          player?.pauseVideo();
+          player?.mute();
         } catch { /* ignore */ }
-        setRoleState('partner_turn');
-        setActiveUserLineIdx(-1);
-        setDiffResult(null);
-        setLastSpoken('');
-        return;
+        setRoleState('user_speaking');
+        try {
+          start();
+        } catch { /* ignore */ }
       } else {
-        // Enforce silent playback during user's video segment
+        // Ensure muted while playing silently
         try {
           player?.mute();
         } catch { /* ignore */ }
-        return;
       }
+      return;
     }
 
-    // ── STEP 2 & 3 ENFORCEMENT: While speaking or retry, keep PAUSED & MUTED ─
+    // ── KEEP PAUSED & MUTED while speaking or retrying ────────────────────────
     if (roleState === 'user_speaking' || roleState === 'user_retry') {
       try {
         player?.mute();
@@ -205,23 +184,26 @@ export function RolePlayMode() {
       return;
     }
 
-    // ── STEP 1: Partner's Turn (Video plays unmuted) ──────────────────────────
+    // ── STEP 1 & 2: PARTNER'S TURN & TRANSITION TO USER ACTING ────────────────
     if (roleState === 'partner_turn') {
-      // Check if current playback time hit a user turn
-      for (let i = 0; i < transcript.length; i++) {
-        const line = transcript[i];
-        const speaker = (i % 2) as 0 | 1;
-        const isUser = speaker === userRole;
+      for (let i = 0; i < turns.length; i++) {
+        const turn = turns[i];
+        if (turn.speaker !== userRole) continue;
+        if (completedTurnsRef.current.has(i)) continue;
 
-        if (!isUser) continue;
+        const turnStart = turn.offset;
+        const turnEnd = turn.offset + turn.duration;
 
-        const lineStart = line.offset;
-        const lineEnd = line.offset + line.duration;
-        const isWithinWindow = timeMs >= lineStart - 80 && timeMs <= lineEnd;
-
-        if (isWithinWindow && !completedLinesRef.current.has(i)) {
-          // User's turn starts! Instantly mute & pause
-          triggerUserTurn(i);
+        // User's turn starts: MUTE video, but KEEP PLAYING so user watches character act
+        if (timeMs >= turnStart - 80 && timeMs < turnEnd) {
+          try {
+            player?.mute(); // MUTE
+            // DO NOT PAUSE — keep playing silently
+          } catch { /* ignore */ }
+          setActiveTurnIdx(i);
+          setRoleState('user_acting');
+          setDiffResult(null);
+          setLastSpoken('');
           return;
         }
       }
@@ -231,16 +213,9 @@ export function RolePlayMode() {
         player?.unMute();
       } catch { /* ignore */ }
     }
-  }, [
-    currentTimeSec,
-    transcript,
-    userRole,
-    roleState,
-    activeUserLineIdx,
-    triggerUserTurn,
-  ]);
+  }, [currentTimeSec, turns, userRole, roleState, activeTurnIdx, start]);
 
-  // Clean unmount: restore audio
+  // Clean unmount
   useEffect(() => {
     return () => {
       try {
@@ -262,58 +237,72 @@ export function RolePlayMode() {
     start();
   };
 
-  const handleReplayUserAudio = () => {
-    if (activeUserLineIdx >= 0 && transcript[activeUserLineIdx]) {
-      const line = transcript[activeUserLineIdx];
+  const handleReplayNativeLine = () => {
+    if (activeTurnIdx >= 0 && turns[activeTurnIdx]) {
+      const turn = turns[activeTurnIdx];
       const player = getGlobalPlayer();
       try {
-        player?.unMute(); // Allow native speaker listening preview
-        player?.seekTo(line.offset / 1000, true);
+        player?.unMute();
+        player?.seekTo(turn.offset / 1000, true);
         player?.playVideo();
       } catch { /* ignore */ }
 
-      // When the native reference finishes playing, mute and pause again for speech
+      // When the native reference finishes, pause again for speaking
       setTimeout(() => {
         try {
           player?.mute();
           player?.pauseVideo();
         } catch { /* ignore */ }
         handleRetrySpeaking();
-      }, line.duration + 200);
+      }, turn.duration + 200);
     }
   };
 
   const handleSkipTurn = () => {
-    if (autoResumeTimerRef.current) clearTimeout(autoResumeTimerRef.current);
-    if (activeUserLineIdx >= 0) {
-      completedLinesRef.current.add(activeUserLineIdx);
+    if (resumeTimerRef.current) clearTimeout(resumeTimerRef.current);
+    if (activeTurnIdx >= 0) {
+      completedTurnsRef.current.add(activeTurnIdx);
     }
     abort();
     const player = getGlobalPlayer();
-    const nextLine = activeUserLineIdx >= 0 && transcript[activeUserLineIdx + 1]
-      ? transcript[activeUserLineIdx + 1]
-      : null;
+    const nextTurn = activeTurnIdx >= 0 && turns[activeTurnIdx + 1] ? turns[activeTurnIdx + 1] : null;
     try {
-      if (nextLine) {
-        player?.seekTo(nextLine.offset / 1000, true);
+      if (nextTurn) {
+        player?.seekTo(nextTurn.offset / 1000, true);
       }
       player?.unMute();
       player?.playVideo();
     } catch { /* ignore */ }
     setRoleState('partner_turn');
-    setActiveUserLineIdx(-1);
+    setActiveTurnIdx(-1);
+    setDiffResult(null);
+    setLastSpoken('');
+  };
+
+  const handleManualTriggerTurn = (index: number) => {
+    const turn = turns[index];
+    if (!turn) return;
+    const player = getGlobalPlayer();
+    try {
+      player?.mute();
+      player?.seekTo(turn.offset / 1000, true);
+      player?.playVideo();
+    } catch { /* ignore */ }
+    setActiveTurnIdx(index);
+    setRoleState('user_acting');
     setDiffResult(null);
     setLastSpoken('');
   };
 
   return (
     <div
+      id="role-play-mode"
       className="animate-fade-in"
       style={{
         background: 'var(--bg-card)',
         border: '1.5px solid var(--border-subtle)',
         borderRadius: 18,
-        padding: '18px 20px',
+        padding: '16px 18px',
         boxShadow: 'var(--shadow-sm)',
         display: 'flex',
         flexDirection: 'column',
@@ -322,31 +311,31 @@ export function RolePlayMode() {
     >
       {/* Header */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 6 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <div
             style={{
-              width: 28,
-              height: 28,
+              width: 30,
+              height: 30,
               borderRadius: 8,
-              background: 'var(--accent-50)',
+              background: 'linear-gradient(135deg,#6366f1,#8b5cf6)',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
             }}
           >
-            <Users size={14} color="var(--accent-600)" />
+            <Users size={15} color="#fff" />
           </div>
           <div>
-            <h3 style={{ fontSize: 13.5, fontWeight: 700, color: 'var(--text-primary)', lineHeight: 1.2 }}>
+            <h3 style={{ fontSize: 13.5, fontWeight: 700, color: 'var(--text-primary)', lineHeight: 1.2, margin: 0 }}>
               Role-Play Dialogue Practice
             </h3>
             <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-              6-Step Sequence: Instant Pause & Mute → Spoken Validation → Silent Playback → Auto-Unmute
+              Natural sequence: Partner speaks (Audio ON) → Watch silently (Muted) → Pause & speak → Resume
             </span>
           </div>
         </div>
 
-        {/* Live Audio & Mic Status Badge */}
+        {/* Live Status Badge */}
         <span
           style={{
             fontSize: 11,
@@ -354,43 +343,54 @@ export function RolePlayMode() {
             padding: '4px 10px',
             borderRadius: 8,
             background:
-              roleState === 'user_speaking' || roleState === 'user_retry'
+              roleState === 'user_acting'
+                ? '#e0e7ff'
+                : roleState === 'user_speaking' || roleState === 'user_retry'
                 ? '#fef3c7'
-                : roleState === 'user_silent_play'
-                ? '#f3e8ff'
+                : roleState === 'user_passed'
+                ? '#dcfce7'
                 : 'var(--accent-50)',
             color:
-              roleState === 'user_speaking' || roleState === 'user_retry'
+              roleState === 'user_acting'
+                ? '#4338ca'
+                : roleState === 'user_speaking' || roleState === 'user_retry'
                 ? '#b45309'
-                : roleState === 'user_silent_play'
-                ? '#7e22ce'
+                : roleState === 'user_passed'
+                ? '#15803d'
                 : 'var(--accent-700)',
             display: 'inline-flex',
             alignItems: 'center',
             gap: 5,
             border: `1px solid ${
-              roleState === 'user_speaking' || roleState === 'user_retry'
+              roleState === 'user_acting'
+                ? '#c7d2fe'
+                : roleState === 'user_speaking' || roleState === 'user_retry'
                 ? '#fde68a'
-                : roleState === 'user_silent_play'
-                ? '#e9d5ff'
+                : roleState === 'user_passed'
+                ? '#bbf7d0'
                 : 'var(--accent-200)'
             }`,
           }}
         >
-          {roleState === 'user_speaking' || roleState === 'user_retry' ? (
+          {roleState === 'user_acting' ? (
+            <>
+              <Eye size={13} color="#4338ca" />
+              <span>WATCHING CHARACTER (MUTED PLAYBACK)</span>
+            </>
+          ) : roleState === 'user_speaking' || roleState === 'user_retry' ? (
             <>
               <VolumeX size={13} color="#b45309" />
-              <span>YOUR TURN: PAUSED & MUTED</span>
+              <span>YOUR TURN: PAUSED & SPEAK</span>
             </>
-          ) : roleState === 'user_silent_play' ? (
+          ) : roleState === 'user_passed' ? (
             <>
-              <VolumeX size={13} color="#7e22ce" />
-              <span>PASSED: SILENT PLAYBACK (MUTED)</span>
+              <Volume2 size={13} color="#15803d" />
+              <span>PASSED! UNMUTING & RESUMING…</span>
             </>
           ) : (
             <>
               <Volume2 size={13} />
-              <span>PARTNER SPEAKING (AUDIO UNMUTED)</span>
+              <span>PARTNER SPEAKING (AUDIO ON)</span>
             </>
           )}
         </span>
@@ -410,9 +410,9 @@ export function RolePlayMode() {
         <button
           onClick={() => {
             setUserRole(0);
-            completedLinesRef.current.clear();
+            completedTurnsRef.current.clear();
             setRoleState('partner_turn');
-            setActiveUserLineIdx(-1);
+            setActiveTurnIdx(-1);
             setDiffResult(null);
             setLastSpoken('');
             abort();
@@ -425,7 +425,7 @@ export function RolePlayMode() {
           style={{
             padding: '8px 12px',
             borderRadius: 9,
-            border: userRole === 0 ? '1px solid var(--accent-300)' : '1px solid transparent',
+            border: userRole === 0 ? '1.5px solid var(--accent-400)' : '1px solid transparent',
             background: userRole === 0 ? 'var(--bg-card)' : 'transparent',
             boxShadow: userRole === 0 ? 'var(--shadow-sm)' : 'none',
             color: userRole === 0 ? 'var(--accent-600)' : 'var(--text-secondary)',
@@ -436,14 +436,14 @@ export function RolePlayMode() {
             transition: 'all 0.15s ease',
           }}
         >
-          🎭 Play Speaker A (Pause on A & speak)
+          🎭 Play Speaker A (Turn 1, 3, 5…)
         </button>
         <button
           onClick={() => {
             setUserRole(1);
-            completedLinesRef.current.clear();
+            completedTurnsRef.current.clear();
             setRoleState('partner_turn');
-            setActiveUserLineIdx(-1);
+            setActiveTurnIdx(-1);
             setDiffResult(null);
             setLastSpoken('');
             abort();
@@ -456,7 +456,7 @@ export function RolePlayMode() {
           style={{
             padding: '8px 12px',
             borderRadius: 9,
-            border: userRole === 1 ? '1px solid var(--accent-300)' : '1px solid transparent',
+            border: userRole === 1 ? '1.5px solid var(--accent-400)' : '1px solid transparent',
             background: userRole === 1 ? 'var(--bg-card)' : 'transparent',
             boxShadow: userRole === 1 ? 'var(--shadow-sm)' : 'none',
             color: userRole === 1 ? 'var(--accent-600)' : 'var(--text-secondary)',
@@ -467,7 +467,7 @@ export function RolePlayMode() {
             transition: 'all 0.15s ease',
           }}
         >
-          🎭 Play Speaker B (Pause on B & speak)
+          🎭 Play Speaker B (Turn 2, 4, 6…)
         </button>
       </div>
 
@@ -488,9 +488,9 @@ export function RolePlayMode() {
             <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase' }}>
               Partner Speaking (Audio Unmuted):
             </span>
-            {currentLineInfo && currentLineInfo.isUserTurn && (
+            {currentTurnInfo && currentTurnInfo.isUserTurn && (
               <button
-                onClick={() => triggerUserTurn(currentLineInfo.index)}
+                onClick={() => handleManualTriggerTurn(currentTurnInfo.index)}
                 style={{
                   display: 'inline-flex',
                   alignItems: 'center',
@@ -506,21 +506,51 @@ export function RolePlayMode() {
                 }}
               >
                 <Mic size={12} />
-                Pause & Practice Line Now
+                Practice Line Now
               </button>
             )}
           </div>
 
-          <p style={{ fontSize: 16, fontWeight: 650, color: 'var(--text-primary)', lineHeight: 1.4 }}>
-            {currentLineInfo
-              ? removeConsecutiveDuplicates(currentLineInfo.line.text)
-              : 'Playing video… will instantly mute & pause at your dialogue turn'}
+          <p style={{ fontSize: 16, fontWeight: 650, color: 'var(--text-primary)', lineHeight: 1.4, margin: 0 }}>
+            {currentTurnInfo
+              ? removeConsecutiveDuplicates(currentTurnInfo.turn.text)
+              : 'Playing video… will mute & let you watch your character act, then pause to speak.'}
           </p>
         </div>
       )}
 
-      {/* ── 2, 3, 4: USER'S TURN (Paused, Muted, Mic Active / Retry) ── */}
-      {(roleState === 'user_speaking' || roleState === 'user_retry' || roleState === 'user_silent_play') && activeLine && (
+      {/* ── 2. USER ACTING (Playing silently, Muted) ── */}
+      {roleState === 'user_acting' && activeTurn && (
+        <div
+          className="animate-fade-in"
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 10,
+            padding: '16px 18px',
+            borderRadius: 14,
+            background: 'rgba(99,102,241,0.06)',
+            border: '1.5px solid rgba(99,102,241,0.3)',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <span style={{ fontSize: 11.5, fontWeight: 800, color: '#4338ca', display: 'flex', alignItems: 'center', gap: 6 }}>
+              <Eye size={14} />
+              <span>WATCH YOUR CHARACTER ACT (AUDIO MUTED)</span>
+            </span>
+            <span style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 600 }}>
+              Video will pause automatically when line ends
+            </span>
+          </div>
+
+          <p style={{ fontSize: 18, fontWeight: 700, color: 'var(--text-primary)', lineHeight: 1.4, margin: 0 }}>
+            {targetClean}
+          </p>
+        </div>
+      )}
+
+      {/* ── 3, 4, 5: USER'S TURN (Paused, Muted, Mic Active / Retry / Passed) ── */}
+      {(roleState === 'user_speaking' || roleState === 'user_retry' || roleState === 'user_passed') && activeTurn && (
         <div
           className="animate-fade-in"
           style={{
@@ -530,7 +560,7 @@ export function RolePlayMode() {
             padding: '16px 18px',
             borderRadius: 14,
             background: 'var(--bg-elevated)',
-            border: '1.5px solid var(--border-subtle)',
+            border: `1.5px solid ${roleState === 'user_passed' ? 'rgba(16,185,129,0.4)' : 'var(--border-subtle)'}`,
           }}
         >
           <div>
@@ -539,17 +569,17 @@ export function RolePlayMode() {
                 style={{
                   fontSize: 11,
                   fontWeight: 800,
-                  color: roleState === 'user_silent_play' ? '#7e22ce' : 'var(--accent-600)',
+                  color: roleState === 'user_passed' ? '#15803d' : 'var(--accent-600)',
                   textTransform: 'uppercase',
                   display: 'flex',
                   alignItems: 'center',
                   gap: 5,
                 }}
               >
-                {roleState === 'user_silent_play' ? (
+                {roleState === 'user_passed' ? (
                   <>
-                    <Play size={13} />
-                    <span>STEP 5: PLAYING SILENTLY (AUDIO MUTED)</span>
+                    <Volume2 size={13} color="#15803d" />
+                    <span>PASSED! UNMUTING AND CONTINUING…</span>
                   </>
                 ) : (
                   <>
@@ -560,51 +590,25 @@ export function RolePlayMode() {
               </span>
 
               <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)' }}>
-                {roleState === 'user_silent_play'
-                  ? 'Unmutes automatically for partner'
-                  : 'Unlimited time to speak'}
+                {roleState === 'user_passed' ? 'Next turn starting' : 'Speak your line into the microphone'}
               </span>
             </div>
 
-            <p style={{ fontSize: 18, fontWeight: 750, color: 'var(--text-primary)', lineHeight: 1.35 }}>
+            <p style={{ fontSize: 18, fontWeight: 750, color: 'var(--text-primary)', lineHeight: 1.35, margin: 0 }}>
               {targetClean}
             </p>
           </div>
 
           {/* Granular Word-by-Word Diff & Mic Component */}
-          {roleState !== 'user_silent_play' && (
-            <WordDiffFeedback
-              diffResult={diffResult}
-              spokenText={spokenText || lastSpoken}
-              isListening={isListening}
-              onStopSpeaking={stopAndEvaluate}
-              passingThreshold={80}
-            />
-          )}
+          <WordDiffFeedback
+            diffResult={diffResult}
+            spokenText={spokenText || lastSpoken}
+            isListening={isListening}
+            onStopSpeaking={stopAndEvaluate}
+            passingThreshold={80}
+          />
 
-          {roleState === 'user_silent_play' && (
-            <div
-              style={{
-                padding: '10px 14px',
-                borderRadius: 10,
-                background: '#faf5ff',
-                border: '1px solid #e9d5ff',
-                display: 'flex',
-                alignItems: 'center',
-                gap: 8,
-                color: '#6b21a8',
-                fontSize: 13,
-                fontWeight: 650,
-              }}
-            >
-              <VolumeX size={16} />
-              <span>
-                Pronunciation approved ({diffResult?.score || 100}%). Video playing silently so actor does not speak over your attempt.
-              </span>
-            </div>
-          )}
-
-          {/* Action buttons (Try Again, Replay Audio, Skip) */}
+          {/* Action buttons (Try Again, Replay Native Line, Skip) */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
             {roleState === 'user_retry' && (
               <button
@@ -630,7 +634,7 @@ export function RolePlayMode() {
             )}
 
             <button
-              onClick={handleReplayUserAudio}
+              onClick={handleReplayNativeLine}
               style={{
                 display: 'inline-flex',
                 alignItems: 'center',

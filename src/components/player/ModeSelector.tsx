@@ -1,6 +1,17 @@
 'use client';
 
-import { Play, Headphones, MessageSquareDashed, Users, Ear, BookOpen, Loader2, CheckCircle2 } from 'lucide-react';
+import {
+  Play,
+  Headphones,
+  MessageSquareDashed,
+  Users,
+  Ear,
+  BookOpen,
+  PenLine,
+  Radio,
+  Loader2,
+  CheckCircle2,
+} from 'lucide-react';
 import { useAppStore } from '@/store/appStore';
 import type { LearningMode } from '@/lib/types';
 
@@ -31,7 +42,7 @@ const MODES: { id: LearningMode; label: string; Icon: React.ElementType; badge: 
     label: 'Role-Play',
     badge: 'Dialogue',
     Icon: Users,
-    description: 'Mutes video during your speaker turn so you read subtitles aloud',
+    description: 'Watch character act silently, pause, speak line, auto-resume',
   },
   {
     id: 'blindListening',
@@ -45,7 +56,21 @@ const MODES: { id: LearningMode; label: string; Icon: React.ElementType; badge: 
     label: 'Grammar',
     badge: 'Conjugation',
     Icon: BookOpen,
-    description: 'Auto-pauses on verbs — pick the correct conjugated form',
+    description: 'Targeted verb practice — auto-pauses to quiz conjugations',
+  },
+  {
+    id: 'writing',
+    label: 'Writing Exercises',
+    badge: 'Schreiben',
+    Icon: PenLine,
+    description: 'Smart diktat, role-play chat & type-the-gap with virtual umlaut keyboard',
+  },
+  {
+    id: 'voiceDubbing',
+    label: 'Voice Dubbing',
+    badge: 'Fluency',
+    Icon: Radio,
+    description: 'Mute original audio, record your own voice track, and watch your dub',
   },
 ];
 
@@ -90,7 +115,7 @@ export function ModeSelector() {
               textTransform: 'uppercase',
             }}
           >
-            6 Learning Modes
+            8 Learning Modes
           </span>
           <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>·</span>
           <span style={{ fontSize: 11, color: 'var(--text-secondary)', fontWeight: 500 }}>
@@ -151,16 +176,14 @@ export function ModeSelector() {
         </div>
       </div>
 
-      {/* Segmented Control Buttons (All 5 Modes) */}
+      {/* Horizontally scrollable row with sleek Tailwind classes */}
       <div
+        className="flex overflow-x-auto whitespace-nowrap scrollbar-hide gap-1.5 p-1"
         style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(auto-fit, minmax(105px, 1fr))',
-          gap: 6,
           background: 'var(--bg-elevated)',
           borderRadius: 12,
-          padding: 4,
           border: '1px solid var(--border-subtle)',
+          WebkitOverflowScrolling: 'touch',
         }}
       >
         {MODES.map(({ id, label, badge, Icon }) => {
@@ -171,13 +194,15 @@ export function ModeSelector() {
               id={`mode-toggle-${id}`}
               type="button"
               onClick={() => setActiveMode(id)}
+              className="flex-shrink-0"
               style={{
-                display: 'flex',
+                display: 'inline-flex',
                 flexDirection: 'column',
                 alignItems: 'center',
                 justifyContent: 'center',
                 gap: 2,
-                padding: '8px 6px',
+                padding: '8px 12px',
+                minWidth: 102,
                 borderRadius: 9,
                 border: isActive ? '1px solid var(--accent-300)' : '1px solid transparent',
                 cursor: 'pointer',

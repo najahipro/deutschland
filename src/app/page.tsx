@@ -25,6 +25,8 @@ import { VoiceGapFillMode } from '@/components/player/LearningModes/VoiceGapFill
 import { RolePlayMode } from '@/components/player/LearningModes/RolePlayMode';
 import { BlindListeningMode } from '@/components/player/LearningModes/BlindListeningMode';
 import { GrammarMode } from '@/components/player/LearningModes/GrammarMode';
+import { WritingMode } from '@/components/player/LearningModes/WritingMode';
+import { VoiceDubbingMode } from '@/components/player/LearningModes/VoiceDubbingMode';
 import { HistoryPanel } from '@/components/history/HistoryPanel';
 import { Sidebar } from '@/components/layout/Sidebar';
 import { useAppStore } from '@/store/appStore';
@@ -356,6 +358,16 @@ export default function Home() {
                         <GrammarMode />
                       </div>
                     )}
+                    {activeMode === 'writing' && (
+                      <div className="animate-fade-in">
+                        <WritingMode />
+                      </div>
+                    )}
+                    {activeMode === 'voiceDubbing' && (
+                      <div className="animate-fade-in">
+                        <VoiceDubbingMode />
+                      </div>
+                    )}
                   </>
                 )}
 
@@ -463,6 +475,10 @@ export default function Home() {
                   <BlindListeningMode />
                 ) : activeMode === 'grammar' ? (
                   <GrammarMode />
+                ) : activeMode === 'writing' ? (
+                  <WritingMode />
+                ) : activeMode === 'voiceDubbing' ? (
+                  <VoiceDubbingMode />
                 ) : (
                   <div
                     style={{

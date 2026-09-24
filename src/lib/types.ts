@@ -30,8 +30,16 @@ export interface RepeatedSentence {
   firstOffset: number; // ms — jump to this timestamp on click
 }
 
-/** The 5 interactive learning modes */
-export type LearningMode = 'none' | 'shadowing' | 'voiceGapFill' | 'rolePlay' | 'blindListening' | 'grammar';
+/** The 8 interactive learning modes */
+export type LearningMode =
+  | 'none'
+  | 'shadowing'
+  | 'voiceGapFill'
+  | 'rolePlay'
+  | 'blindListening'
+  | 'grammar'
+  | 'writing'
+  | 'voiceDubbing';
 
 /** Saved timestamp bookmark / flashcard */
 export interface BookmarkEntry {
