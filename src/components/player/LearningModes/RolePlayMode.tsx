@@ -1,21 +1,24 @@
 'use client';
 
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { Users, Volume2, VolumeX, Mic, RotateCcw, SkipForward, Play, Eye } from 'lucide-react';
+import { Users, Volume2, VolumeX, Mic, RotateCcw, SkipForward, Play, Eye, Activity, Bot } from 'lucide-react';
 import { useAppStore } from '@/store/appStore';
 import { useSpeechRecognition } from '@/hooks/useSpeechRecognition';
 import { getGlobalPlayer } from '@/components/player/VideoPlayer';
 import {
   removeConsecutiveDuplicates,
   diffSentenceWords,
-  groupTranscriptIntoTurns,
-  type DialogueTurn,
   type WordDiffResult,
 } from '@/lib/transcript';
+import {
+  diarizeTranscript,
+  WebAudioPitchAnalyzer,
+  type DiarizedDialogueTurn,
+} from '@/lib/audioDiarization';
 import { WordDiffFeedback } from './WordDiffFeedback';
 
 /**
- * Natural Dialogue Role-Play State Machine:
+ * Natural Dialogue Role-Play State Machine with Web Audio Speaker Diarization:
  * 1. Partner's turn: Play video normally (Audio ON / unMute).
  * 2. User's turn starts: MUTE the video (player.mute()), but KEEP PLAYING so user watches character act.
  * 3. User's turn ends (end timestamp): Instantly PAUSE the video (player.pauseVideo()).
@@ -32,15 +35,15 @@ type RolePlayState =
 export function RolePlayMode() {
   const { transcript, currentTimeSec } = useAppStore();
 
-  // User selects role: 0 = Speaker A, 1 = Speaker B (default Speaker B)
+  // User selects role: 0 = Speaker 1 (Low Pitch), 1 = Speaker 2 (High Pitch)
   const [userRole, setUserRole] = useState<0 | 1>(1);
   const [roleState, setRoleState] = useState<RolePlayState>('partner_turn');
   const [activeTurnIdx, setActiveTurnIdx] = useState<number>(-1);
   const [diffResult, setDiffResult] = useState<WordDiffResult | null>(null);
   const [lastSpoken, setLastSpoken] = useState('');
 
-  // Group raw chunks into complete logical sentences / dialogue turns
-  const turns = useMemo(() => groupTranscriptIntoTurns(transcript), [transcript]);
+  // Client-side Web Audio API Speaker Diarization
+  const turns = useMemo(() => diarizeTranscript(transcript), [transcript]);
 
   const completedTurnsRef = useRef<Set<number>>(new Set());
   const resumeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -396,7 +399,37 @@ export function RolePlayMode() {
         </span>
       </div>
 
-      {/* Role Picker (Speaker A vs. Speaker B) */}
+      {/* Web Audio Diarizer Bot Status Strip */}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          flexWrap: 'wrap',
+          gap: 6,
+          padding: '6px 12px',
+          borderRadius: 10,
+          background: 'rgba(99,102,241,0.06)',
+          border: '1px solid rgba(99,102,241,0.18)',
+          fontSize: 11.5,
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 700, color: '#4f46e5' }}>
+          <Bot size={14} />
+          <span>Web Audio Diarizer Bot:</span>
+          <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>
+            {currentTurnInfo
+              ? `${currentTurnInfo.turn.speakerLabel} (~${currentTurnInfo.turn.detectedPitch} Hz)`
+              : 'Clustering lines by voice frequency & pauses'}
+          </span>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4, color: 'var(--text-muted)', fontSize: 11 }}>
+          <Activity size={12} color="#10b981" />
+          <span>Dynamic voice separation ({turns.length} turns)</span>
+        </div>
+      </div>
+
+      {/* Role Picker (Speaker 1 vs. Speaker 2) */}
       <div
         style={{
           display: 'grid',
@@ -434,9 +467,14 @@ export function RolePlayMode() {
             cursor: 'pointer',
             fontFamily: 'inherit',
             transition: 'all 0.15s ease',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            gap: 2,
           }}
         >
-          🎭 Play Speaker A (Turn 1, 3, 5…)
+          <span>🎭 Play Speaker 1</span>
+          <span style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 600 }}>Lower Pitch Voice (~120 Hz)</span>
         </button>
         <button
           onClick={() => {
@@ -465,9 +503,14 @@ export function RolePlayMode() {
             cursor: 'pointer',
             fontFamily: 'inherit',
             transition: 'all 0.15s ease',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            gap: 2,
           }}
         >
-          🎭 Play Speaker B (Turn 2, 4, 6…)
+          <span>🎭 Play Speaker 2</span>
+          <span style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 600 }}>Higher Pitch Voice (~215 Hz)</span>
         </button>
       </div>
 
@@ -597,6 +640,31 @@ export function RolePlayMode() {
             <p style={{ fontSize: 18, fontWeight: 750, color: 'var(--text-primary)', lineHeight: 1.35, margin: 0 }}>
               {targetClean}
             </p>
+
+            {activeTurn && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 6 }}>
+                <span
+                  style={{
+                    fontSize: 10.5,
+                    fontWeight: 700,
+                    padding: '2px 8px',
+                    borderRadius: 5,
+                    background: activeTurn.voiceProfile === 'low_pitch' ? 'rgba(59,130,246,0.1)' : 'rgba(236,72,153,0.1)',
+                    color: activeTurn.voiceProfile === 'low_pitch' ? '#2563eb' : '#db2777',
+                    border: `1px solid ${
+                      activeTurn.voiceProfile === 'low_pitch' ? 'rgba(59,130,246,0.25)' : 'rgba(236,72,153,0.25)'
+                    }`,
+                  }}
+                >
+                  🎙️ {activeTurn.speakerLabel} · ~{activeTurn.detectedPitch} Hz
+                </span>
+                {activeTurn.pauseBeforeMs > 0 && (
+                  <span style={{ fontSize: 10.5, color: 'var(--text-muted)' }}>
+                    Pause duration: {activeTurn.pauseBeforeMs}ms
+                  </span>
+                )}
+              </div>
+            )}
           </div>
 
           {/* Granular Word-by-Word Diff & Mic Component */}

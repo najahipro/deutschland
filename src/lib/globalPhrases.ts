@@ -179,6 +179,9 @@ export function recordTranscriptPhrases(
     const store = getStoredGlobalPhrases();
     const now = new Date().toISOString();
 
+    // 1. Deduplicate phrases within the current video's transcript
+    const videoPhraseMap = new Map<string, string>(); // phraseKey -> cleanOriginalText
+
     for (const line of lines) {
       if (!line?.text) continue;
       // Split into sentence-like clauses
@@ -198,34 +201,46 @@ export function recordTranscriptPhrases(
           continue;
         }
 
-        const cleanOriginal = raw
-          .replace(/\[.*?\]|\(.*?\)|♪/g, '')
-          .replace(/^\s*[,\-–—\s]+/, '')
-          .trim();
+        if (!videoPhraseMap.has(key)) {
+          const cleanOriginal = raw
+            .replace(/\[.*?\]|\(.*?\)|♪/g, '')
+            .replace(/^\s*[,\-–—\s]+/, '')
+            .trim();
+          videoPhraseMap.set(key, cleanOriginal || raw);
+        }
+      }
+    }
 
-        if (!store[key]) {
-          store[key] = {
-            phraseKey: key,
-            originalText: cleanOriginal || raw,
-            videoIds: [videoId],
-            videoTitles: { [videoId]: videoTitle || 'YouTube Video' },
-            occurrencesCount: 1,
-            uniqueVideoCount: 1,
-            firstSeenAt: now,
-            lastSeenAt: now,
-          };
-        } else {
-          const entry = store[key];
-          if (!entry.videoIds.includes(videoId)) {
-            entry.videoIds.push(videoId);
-            entry.uniqueVideoCount = entry.videoIds.length;
-          }
-          if (videoTitle) {
-            entry.videoTitles = entry.videoTitles || {};
-            entry.videoTitles[videoId] = videoTitle;
-          }
+    // 2. Update global store: strictly prevent duplicate counting on video replay/loop
+    for (const [key, cleanOriginal] of videoPhraseMap.entries()) {
+      if (!store[key]) {
+        // New phrase seen for the first time
+        store[key] = {
+          phraseKey: key,
+          originalText: cleanOriginal,
+          videoIds: [videoId],
+          videoTitles: { [videoId]: videoTitle || 'YouTube Video' },
+          occurrencesCount: 1,
+          uniqueVideoCount: 1,
+          firstSeenAt: now,
+          lastSeenAt: now,
+        };
+      } else {
+        const entry = store[key];
+        const isNewVideo = !entry.videoIds.includes(videoId);
+
+        if (isNewVideo) {
+          // Only increment global frequency count if sentence is from a NEW unique videoId!
+          entry.videoIds.push(videoId);
+          entry.uniqueVideoCount = entry.videoIds.length;
           entry.occurrencesCount += 1;
           entry.lastSeenAt = now;
+        }
+
+        // Keep video title recorded if available
+        if (videoTitle) {
+          entry.videoTitles = entry.videoTitles || {};
+          entry.videoTitles[videoId] = videoTitle;
         }
       }
     }

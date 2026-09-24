@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
-import { CheckCircle2, XCircle, BookOpen, SkipForward, Search, Target, Sparkles, ChevronDown } from 'lucide-react';
+import { CheckCircle2, XCircle, BookOpen, SkipForward, Search, Target, Sparkles, ChevronDown, Eye, EyeOff } from 'lucide-react';
 import { useAppStore } from '@/store/appStore';
 import { getGlobalPlayer } from '@/components/player/VideoPlayer';
 
@@ -119,6 +119,7 @@ export function GrammarMode() {
   const [searchInput, setSearchInput] = useState('');
   const [targetVerb, setTargetVerb] = useState<VerbEntry | null>(null);
   const [showDropdown, setShowDropdown] = useState(false);
+  const [showHintTable, setShowHintTable] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
@@ -352,9 +353,36 @@ export function GrammarMode() {
 
       {/* ── Verb Selector ──────────────────────────────────────────────────── */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6, position: 'relative' }}>
-        <label style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', letterSpacing: '0.06em', textTransform: 'uppercase' }}>
-          Target Verb (Infinitive)
-        </label>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <label style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', letterSpacing: '0.06em', textTransform: 'uppercase' }}>
+            Target Verb (Infinitive)
+          </label>
+          {targetVerb && (
+            <button
+              id="grammar-toggle-hints-btn"
+              type="button"
+              onClick={() => setShowHintTable((prev) => !prev)}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 5,
+                background: 'transparent',
+                border: 'none',
+                color: showHintTable ? '#7c3aed' : 'var(--text-muted)',
+                fontSize: 11,
+                fontWeight: 650,
+                cursor: 'pointer',
+                padding: '2px 6px',
+                borderRadius: 6,
+                transition: 'all 0.15s ease',
+              }}
+              title={showHintTable ? 'Hide Conjugation Table' : 'Show Conjugation Table (Peek Hint)'}
+            >
+              {showHintTable ? <EyeOff size={12} /> : <Eye size={12} />}
+              <span>{showHintTable ? 'Hide Table' : 'Peek Conjugations'}</span>
+            </button>
+          )}
+        </div>
 
         <div style={{ position: 'relative' }}>
           {/* Search input */}
@@ -450,9 +478,10 @@ export function GrammarMode() {
           )}
         </div>
 
-        {/* Conjugation preview for selected verb */}
-        {targetVerb && (
+        {/* Conjugation preview for selected verb — HIDDEN by default to prevent giving away answers */}
+        {targetVerb && showHintTable && (
           <div
+            className="animate-fade-in"
             style={{
               display: 'flex', flexWrap: 'wrap', gap: 5,
               padding: '8px 10px', borderRadius: 10,
@@ -722,6 +751,49 @@ function QuizCard({
               </button>
             </div>
           )}
+        </div>
+      )}
+
+      {/* ── Correction Guide: Reveal full conjugations only after incorrect answer ── */}
+      {isIncorrect && (
+        <div
+          className="animate-fade-in"
+          style={{
+            marginTop: 4,
+            padding: '10px 12px',
+            borderRadius: 10,
+            background: 'rgba(239,68,68,0.05)',
+            border: '1px solid rgba(239,68,68,0.2)',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 6,
+          }}
+        >
+          <div style={{ fontSize: 11, fontWeight: 750, color: '#dc2626', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+            Correction Guide · Conjugation of &ldquo;{question.targetVerb.infinitive}&rdquo;:
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+            {PRONOUN_KEYS.map((p) => {
+              const isTargetForm = p === question.correctPronoun;
+              return (
+                <span
+                  key={p}
+                  style={{
+                    fontSize: 11,
+                    padding: '3px 8px',
+                    borderRadius: 6,
+                    background: isTargetForm ? 'rgba(16,185,129,0.15)' : 'var(--bg-card)',
+                    border: `1px solid ${isTargetForm ? 'rgba(16,185,129,0.45)' : 'var(--border-subtle)'}`,
+                    color: isTargetForm ? '#059669' : 'var(--text-secondary)',
+                    fontWeight: isTargetForm ? 800 : 500,
+                  }}
+                >
+                  {PRONOUN_LABELS[p]} <strong>{question.targetVerb[p]}</strong>
+                  {isTargetForm && ' ✓'}
+                </span>
+              );
+            })}
+          </div>
         </div>
       )}
 
